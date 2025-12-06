@@ -5,7 +5,7 @@ import os
 import socket
 import time
 from pathlib import Path
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Tuple
 
 import docker
 import psutil
@@ -209,6 +209,44 @@ def repo_update_status(apply: bool = False) -> Dict[str, Any]:
         return {"error": str(exc), "applied": False}
 
 
+def execute_ssh_command(host: str, command: str, allowed_hosts: List[str]) -> Tuple[Dict[str, Any], int]:
+    if host not in allowed_hosts:
+        return {"error": "Host is not part of the swarm or is unreachable."}, 400
+
+    if not command:
+        return {"error": "Command is required."}, 400
+
+    try:
+        result = run(
+            [
+                "ssh",
+                "-o",
+                "StrictHostKeyChecking=no",
+                f"pi@{host}",
+                command,
+            ],
+            capture_output=True,
+            text=True,
+            timeout=20,
+            check=False,
+        )
+    except FileNotFoundError:
+        return {"error": "SSH client is not available on this host."}, 500
+    except Exception as exc:  # noqa: BLE001
+        return {"error": str(exc)}, 500
+
+    payload: Dict[str, Any] = {
+        "host": host,
+        "command": command,
+        "return_code": result.returncode,
+        "stdout": result.stdout,
+        "stderr": result.stderr,
+    }
+
+    status = 200 if result.returncode == 0 else 400
+    return payload, status
+
+
 def build_insights(host: Dict[str, Any], nodes: List[Dict[str, Any]], services: List[Dict[str, Any]]) -> Dict[str, Any]:
     messages: List[Dict[str, str]] = []
 
@@ -404,6 +442,19 @@ def apply_update() -> Any:
     status = repo_update_status(apply)
     code = 200 if status.get("error") is None else 500
     return jsonify(status), code
+
+
+@app.post("/api/admin/ssh-run")
+def run_ssh() -> Any:
+    payload = request.get_json(silent=True) or {}
+    host = str(payload.get("host", "")).strip()
+    command = str(payload.get("command", "")).strip()
+
+    nodes = collect_nodes()
+    allowed_hosts = [n.get("addr") for n in nodes if n.get("addr")]
+
+    result, status = execute_ssh_command(host, command, allowed_hosts)
+    return jsonify(result), status
 
 
 @app.route("/")
