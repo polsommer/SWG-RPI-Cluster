@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import datetime as dt
 import os
+import shutil
 import socket
 import time
 from pathlib import Path
@@ -185,6 +186,12 @@ def git_command(args: List[str]) -> CompletedProcess[str]:
 
 def repo_update_status(apply: bool = False) -> Dict[str, Any]:
     try:
+        if shutil.which("git") is None:
+            return {
+                "error": "Git client is not installed on this host. Install git to enable auto-updates.",
+                "applied": False,
+            }
+
         git_command(["git", "fetch", "origin"])
         branch = git_command(["git", "rev-parse", "--abbrev-ref", "HEAD"]).stdout.strip()
         local_rev = git_command(["git", "rev-parse", "HEAD"]).stdout.strip()
@@ -205,8 +212,14 @@ def repo_update_status(apply: bool = False) -> Dict[str, Any]:
             "applied": apply and behind > 0,
             "output": output or None,
         }
-    except (CalledProcessError, FileNotFoundError) as exc:  # noqa: PERF203
-        return {"error": str(exc), "applied": False}
+    except FileNotFoundError:
+        return {
+            "error": "Unable to run git commands because the git executable could not be found.",
+            "applied": False,
+        }
+    except CalledProcessError as exc:  # noqa: PERF203
+        stderr = exc.stderr.strip() if exc.stderr else str(exc)
+        return {"error": stderr or "Git command failed", "applied": False}
 
 
 def execute_ssh_command(host: str, command: str, allowed_hosts: List[str]) -> Tuple[Dict[str, Any], int]:

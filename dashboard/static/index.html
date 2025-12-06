@@ -558,11 +558,15 @@
         const res = await fetch('/api/admin/repo-status');
         if (!res.ok) throw new Error('unable to check repo');
         const repo = await res.json();
+        if (repo.error) {
+          setStatus(repo.error, false);
+          return;
+        }
         setStatus(repo.behind ? `${repo.behind} updates pending` : 'Repository is current', !repo.behind);
         await refreshAdmin();
       } catch (err) {
         console.error(err);
-        setStatus('Unable to check updates', false);
+        setStatus(err.message || 'Unable to check updates', false);
       }
     }
 
@@ -570,12 +574,14 @@
       try {
         const res = await fetch('/api/admin/update', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ apply: true }) });
         const repo = await res.json();
-        if (!res.ok || repo.error) throw new Error(repo.error || 'update failed');
+        if (!res.ok || repo.error) {
+          throw new Error(repo.error || 'Update failed');
+        }
         setStatus(repo.behind ? 'Updates applied' : 'Already current', true);
         await refreshAdmin();
       } catch (err) {
         console.error(err);
-        setStatus('Unable to apply updates', false);
+        setStatus(err.message || 'Unable to apply updates', false);
       }
     }
 
