@@ -2,6 +2,8 @@
 
 The Flask-based dashboard ships with the demo stack so you can see swarm health, overlay network reachability, and worker activity in one page. Use these steps when you want to deploy or iterate on the UI quickly.
 
+The Control Center panel now exposes join commands, one-click token rotation, service scaling, and node drain/activation toggles so you can administer the swarm without leaving the browser.
+
 ## Prerequisites
 - The node must already belong to the Docker Swarm (manager node recommended because the dashboard needs the Docker socket).
 - Docker CLI access with permission to read `/var/run/docker.sock`.

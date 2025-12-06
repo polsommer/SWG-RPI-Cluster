@@ -1,0 +1,21 @@
+version: "3.9"
+
+networks:
+  cluster_net:
+    external: true
+
+services:
+  swarm-dashboard:
+    image: swg-dashboard:local
+    networks:
+      - cluster_net
+    environment:
+      - OVERLAY_NETWORK=cluster_net
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    ports:
+      - "8081:8081"
+    deploy:
+      placement:
+        constraints:
+          - node.role == manager

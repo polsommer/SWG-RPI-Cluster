@@ -8,7 +8,7 @@ from typing import Any, Dict, List
 
 import docker
 import psutil
-from flask import Flask, jsonify, send_from_directory
+from flask import Flask, jsonify, request, send_from_directory
 
 app = Flask(__name__, static_folder="static", static_url_path="")
 client = docker.from_env()
@@ -80,6 +80,7 @@ def summarize_services() -> List[Dict[str, Any]]:
                 "desired": desired,
                 "ports": attrs.get("Endpoint", {}).get("Ports", []),
                 "updated": attrs.get("UpdatedAt"),
+                "replicas": replicas,
             }
         )
     return services
@@ -141,6 +142,75 @@ def summary() -> Any:
         "timestamp": dt.datetime.utcnow().isoformat() + "Z",
     }
     return jsonify(data)
+
+
+@app.route("/api/admin")
+def admin() -> Any:
+    swarm = client.api.inspect_swarm()
+    join_tokens = swarm.get("JoinTokens", {})
+    managers = client.info().get("Swarm", {}).get("RemoteManagers", [])
+    advertise_addr = managers[0].get("Addr") if managers else None
+
+    return jsonify(
+        {
+            "tokens": join_tokens,
+            "advertise_addr": advertise_addr,
+            "nodes": collect_nodes(),
+            "services": summarize_services(),
+            "cluster": swarm,
+        }
+    )
+
+
+@app.post("/api/admin/rotate-tokens")
+def rotate_tokens() -> Any:
+    try:
+        client.swarm.update(rotate_manager_token=True, rotate_worker_token=True)
+        swarm = client.api.inspect_swarm()
+        return jsonify({"tokens": swarm.get("JoinTokens", {})})
+    except Exception as exc:  # noqa: BLE001
+        return jsonify({"error": str(exc)}), 500
+
+
+@app.post("/api/nodes/<node_id>/availability")
+def set_node_availability(node_id: str) -> Any:
+    payload = request.get_json(silent=True) or {}
+    availability = str(payload.get("availability", "")).lower()
+    if availability not in {"active", "drain", "pause"}:
+        return jsonify({"error": "availability must be one of: active, drain, pause"}), 400
+
+    try:
+        node = client.nodes.get(node_id)
+        spec = dict(node.attrs.get("Spec", {}))
+        spec["Availability"] = availability
+        node.update(spec)
+        return jsonify({"ok": True, "node_id": node_id, "availability": availability})
+    except Exception as exc:  # noqa: BLE001
+        return jsonify({"error": str(exc)}), 500
+
+
+@app.post("/api/services/<service_id>/scale")
+def scale_service(service_id: str) -> Any:
+    payload = request.get_json(silent=True) or {}
+    replicas = payload.get("replicas")
+    if replicas is None:
+        return jsonify({"error": "replicas is required"}), 400
+
+    try:
+        replicas_int = max(0, int(replicas))
+    except (TypeError, ValueError):
+        return jsonify({"error": "replicas must be an integer"}), 400
+
+    try:
+        service = client.services.get(service_id)
+        mode = service.attrs.get("Spec", {}).get("Mode", {})
+        if "Replicated" not in mode:
+            return jsonify({"error": "Only replicated services can be scaled."}), 400
+
+        service.scale(replicas_int)
+        return jsonify({"ok": True, "service": service_id, "replicas": replicas_int})
+    except Exception as exc:  # noqa: BLE001
+        return jsonify({"error": str(exc)}), 500
 
 
 @app.route("/")
