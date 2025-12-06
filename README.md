@@ -42,8 +42,10 @@ sudo bash scripts/init-swarm.sh 192.168.88.7
 ```
 
 You’ll see **manager** and **worker** join tokens plus the advertise address
-used. If the node already belongs to a swarm, the script exits with the current
-membership details instead of reinitializing.
+used. The script also builds and auto-deploys the web control module on the
+manager so the dashboard is ready at `http://<manager-ip>:8081` as soon as the
+swarm comes online. If the node already belongs to a swarm, the script exits
+with the current membership details instead of reinitializing.
 
 ### 3) Join the workers
 On `pi-worker1` and `pi-worker2`, supply the worker token and manager IP:
@@ -74,7 +76,10 @@ The compose file (`stack/demo.yml`) launches:
   across the overlay network, logging responder hostname and latency from the
   worker nodes to avoid loading the manager.
 - **swarm-dashboard** – Flask UI on port 8081 (manager-only) that streams swarm
-  health, replica counts, and Redis reachability from the Docker API.
+  health, replica counts, and Redis reachability from the Docker API. The new
+  Control Center panel surfaces join commands, one-click token rotation, service
+  scaling, and node drain/activation switches so you can grow the cluster
+  without reaching for the CLI.
 
 App workloads intentionally land on workers so the manager stays available for
 control-plane tasks. When you deploy your own services, add a placement

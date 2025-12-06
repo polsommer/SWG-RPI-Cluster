@@ -14,6 +14,7 @@
       --accent: #22d3ee;
       --danger: #f87171;
       --success: #34d399;
+      --card-border: rgba(255,255,255,0.08);
       font-family: "Inter", system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
     }
     body {
@@ -30,10 +31,10 @@
       justify-content: space-between;
       gap: 12px;
     }
-    h1 { margin: 0; font-size: 1.6rem; }
+    h1 { margin: 0; font-size: 1.75rem; letter-spacing: -0.02em; }
     .pill { padding: 6px 12px; border-radius: 999px; background: rgba(34,211,238,0.16); color: var(--accent); font-weight: 600; }
     .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); gap: 16px; padding: 0 32px 32px; }
-    .card { background: linear-gradient(145deg, rgba(255,255,255,0.04), rgba(0,0,0,0.2)); border: 1px solid rgba(255,255,255,0.05); border-radius: 14px; padding: 16px; box-shadow: 0 20px 60px rgba(0,0,0,0.35); }
+    .card { background: linear-gradient(145deg, rgba(255,255,255,0.04), rgba(0,0,0,0.2)); border: 1px solid var(--card-border); border-radius: 14px; padding: 16px; box-shadow: 0 20px 60px rgba(0,0,0,0.35); }
     .card h3 { margin: 0 0 8px; }
     .muted { color: var(--muted); }
     table { width: 100%; border-collapse: collapse; font-size: 0.95rem; }
@@ -44,6 +45,19 @@
     .tag.warn { background: rgba(248,113,113,0.12); color: var(--danger); }
     .stacked { display: grid; gap: 6px; }
     .footer { text-align: center; padding: 12px; color: var(--muted); font-size: 0.9rem; }
+    .controls { display: grid; gap: 10px; }
+    .control-row { display: flex; justify-content: space-between; align-items: center; gap: 8px; padding: 10px; border: 1px solid var(--card-border); border-radius: 10px; background: rgba(255,255,255,0.03); }
+    .control-row strong { display: block; }
+    .btn { border: 1px solid var(--card-border); background: rgba(34,211,238,0.12); color: var(--text); padding: 8px 12px; border-radius: 10px; cursor: pointer; font-weight: 700; }
+    .btn:hover { border-color: rgba(34,211,238,0.4); }
+    .btn.ghost { background: transparent; color: var(--muted); }
+    .btn.danger { background: rgba(248,113,113,0.12); border-color: rgba(248,113,113,0.3); color: var(--danger); }
+    .code { font-family: "JetBrains Mono", "SFMono-Regular", Menlo, monospace; font-size: 0.9rem; padding: 8px 10px; border-radius: 10px; background: rgba(0,0,0,0.35); border: 1px solid var(--card-border); word-break: break-all; }
+    .toolbar { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+    .pill.good { background: rgba(52,211,153,0.16); color: var(--success); }
+    .pill.bad { background: rgba(248,113,113,0.12); color: var(--danger); }
+    .inline-input { display: flex; gap: 8px; align-items: center; }
+    input[type="number"] { width: 90px; padding: 8px; border-radius: 10px; border: 1px solid var(--card-border); background: rgba(0,0,0,0.25); color: var(--text); }
     @media (max-width: 720px) { header { flex-direction: column; align-items: flex-start; } }
   </style>
 </head>
@@ -53,7 +67,10 @@
       <h1>Raspberry Pi Swarm Control</h1>
       <div class="muted">Live view of nodes, services, and cluster health</div>
     </div>
-    <div id="timestamp" class="pill">Loading...</div>
+    <div class="toolbar">
+      <div id="timestamp" class="pill">Loading...</div>
+      <div id="admin-status" class="pill good" style="display:none;"></div>
+    </div>
   </header>
 
   <section class="grid">
@@ -93,10 +110,19 @@
     </div>
   </section>
 
+  <section class="grid" style="padding-top: 0;">
+    <div class="card" style="grid-column: 1 / -1;">
+      <h3>Control Center</h3>
+      <div class="muted" style="margin-bottom: 8px;">Join commands, token rotation, and rapid maintenance toggles.</div>
+      <div class="controls" id="admin-panel"></div>
+    </div>
+  </section>
+
   <div class="footer">Auto-refreshing every 5s • Powered by Docker SDK &amp; Flask</div>
 
   <script>
     const $ = (sel) => document.querySelector(sel);
+    const REFRESH_MS = 5000;
 
     function badge(text, ok = true) {
       return `<span class="tag ${ok ? 'ok' : 'warn'}">${text}</span>`;
@@ -159,6 +185,149 @@
       }).join('');
     }
 
+    function copyCommand(id) {
+      const el = document.getElementById(id);
+      if (!el) return;
+      navigator.clipboard.writeText(el.textContent).then(() => setStatus('Copied command to clipboard', true));
+    }
+
+    function setStatus(message, ok = true) {
+      const pill = $('#admin-status');
+      pill.textContent = message;
+      pill.className = `pill ${ok ? 'good' : 'bad'}`;
+      pill.style.display = 'inline-flex';
+      setTimeout(() => pill.style.display = 'none', 3000);
+    }
+
+    async function rotateTokens() {
+      try {
+        const res = await fetch('/api/admin/rotate-tokens', { method: 'POST' });
+        if (!res.ok) throw new Error('Failed to rotate tokens');
+        await refreshAdmin();
+        setStatus('Join tokens rotated', true);
+      } catch (err) {
+        console.error(err);
+        setStatus('Unable to rotate tokens', false);
+      }
+    }
+
+    async function setAvailability(nodeId, state) {
+      try {
+        const res = await fetch(`/api/nodes/${nodeId}/availability`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ availability: state })
+        });
+        if (!res.ok) throw new Error('Failed to update node');
+        await refresh();
+        await refreshAdmin();
+        setStatus(`Node ${nodeId} set to ${state}`, true);
+      } catch (err) {
+        console.error(err);
+        setStatus('Unable to update node', false);
+      }
+    }
+
+    async function scaleService(serviceId, inputId) {
+      const field = document.getElementById(inputId);
+      const replicas = field ? field.value : 1;
+      try {
+        const res = await fetch(`/api/services/${serviceId}/scale`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ replicas })
+        });
+        if (!res.ok) throw new Error('Scale failed');
+        setStatus(`Scaling ${serviceId} to ${replicas} replicas`, true);
+        await refresh();
+        await refreshAdmin();
+      } catch (err) {
+        console.error(err);
+        setStatus('Unable to scale service', false);
+      }
+    }
+
+    function renderAdmin(data) {
+      const tokens = data.tokens || {};
+      const advertise = data.advertise_addr || 'manager:2377';
+      const workerCmd = tokens.Worker ? `docker swarm join --token ${tokens.Worker} ${advertise}` : 'Swarm not initialized yet';
+      const managerCmd = tokens.Manager ? `docker swarm join --token ${tokens.Manager} ${advertise}` : 'Swarm not initialized yet';
+
+      const nodes = data.nodes || [];
+      const services = (data.services || []).filter(s => s.mode === 'replicated');
+
+      $('#admin-panel').innerHTML = `
+        <div class="control-row" style="flex-direction: column; align-items: flex-start;">
+          <div class="toolbar" style="width: 100%; justify-content: space-between; gap: 12px; flex-wrap: wrap;">
+            <div><strong>Join Tokens</strong><div class="muted">Hand these to operators to add nodes instantly.</div></div>
+            <button class="btn" onclick="rotateTokens()">Rotate tokens</button>
+          </div>
+          <div class="stacked" style="width: 100%;">
+            <div class="control-row">
+              <div style="flex:1;">
+                <strong>Worker join</strong>
+                <div class="code" id="worker-command">${workerCmd}</div>
+              </div>
+              <button class="btn ghost" onclick="copyCommand('worker-command')">Copy</button>
+            </div>
+            <div class="control-row">
+              <div style="flex:1;">
+                <strong>Manager join</strong>
+                <div class="code" id="manager-command">${managerCmd}</div>
+              </div>
+              <button class="btn ghost" onclick="copyCommand('manager-command')">Copy</button>
+            </div>
+          </div>
+        </div>
+        <div class="control-row" style="flex-direction: column; align-items: stretch;">
+          <div class="toolbar" style="justify-content: space-between;">
+            <div><strong>Node availability</strong><div class="muted">Drain or reactivate nodes without touching the CLI.</div></div>
+          </div>
+          <div class="stacked">
+            ${nodes.map(n => `
+              <div class="control-row">
+                <div style="flex:1;">
+                  <strong>${n.hostname}</strong>
+                  <div class="muted">${n.role} • ${n.addr || ''}</div>
+                  <div class="muted">Availability: ${n.availability}</div>
+                </div>
+                <div class="toolbar">
+                  <button class="btn" onclick="setAvailability('${n.id}', 'active')">Activate</button>
+                  <button class="btn" onclick="setAvailability('${n.id}', 'pause')">Pause</button>
+                  <button class="btn danger" onclick="setAvailability('${n.id}', 'drain')">Drain</button>
+                </div>
+              </div>
+            `).join('')}
+          </div>
+        </div>
+        <div class="control-row" style="flex-direction: column; align-items: stretch;">
+          <div class="toolbar" style="justify-content: space-between;">
+            <div><strong>Service scaler</strong><div class="muted">Push out more replicas when you add Pi nodes.</div></div>
+          </div>
+          <div class="stacked">
+            ${services.length ? services.map((s, idx) => {
+              const inputId = `scale-${idx}`;
+              const current = s.replicas ?? s.desired ?? 1;
+              return `
+                <div class="control-row">
+                  <div style="flex:1;">
+                    <strong>${s.name}</strong>
+                    <div class="muted">${s.image}</div>
+                    <div class="muted">Current: ${s.running}/${s.desired}</div>
+                  </div>
+                  <div class="inline-input">
+                    <label for="${inputId}" class="muted">Replicas</label>
+                    <input id="${inputId}" type="number" min="0" value="${current}" />
+                    <button class="btn" onclick="scaleService('${s.id}', '${inputId}')">Apply</button>
+                  </div>
+                </div>
+              `;
+            }).join('') : '<div class="muted">No replicated services detected yet.</div>'}
+          </div>
+        </div>
+      `;
+    }
+
     async function refresh() {
       try {
         const res = await fetch('/api/summary');
@@ -170,8 +339,20 @@
       }
     }
 
+    async function refreshAdmin() {
+      try {
+        const res = await fetch('/api/admin');
+        const data = await res.json();
+        renderAdmin(data);
+      } catch (err) {
+        console.error(err);
+      }
+    }
+
     refresh();
-    setInterval(refresh, 5000);
+    refreshAdmin();
+    setInterval(refresh, REFRESH_MS);
+    setInterval(refreshAdmin, REFRESH_MS);
   </script>
 </body>
 </html>
