@@ -49,9 +49,40 @@ def collect_nodes() -> List[Dict[str, Any]]:
                 "memory_gb": round(resources.get("MemoryBytes", 0) / 1024 / 1024 / 1024, 2),
                 "engine_version": desc.get("Engine", {}).get("EngineVersion"),
                 "last_heartbeat": manager.get("LastHeartbeat"),
+                "platform": desc.get("Platform", {}).get("Architecture"),
+                "os": desc.get("Platform", {}).get("OS"),
             }
         )
     return nodes
+
+
+def node_health_state(node: Dict[str, Any]) -> str:
+    if node.get("availability") == "drain":
+        return "maintenance"
+    if node.get("state") in {"down", "disconnected", "unknown"}:
+        return "unreachable"
+    if node.get("reachability") == "unreachable":
+        return "unreachable"
+    if node.get("state") not in {"ready", "active"}:
+        return "degraded"
+    return "healthy"
+
+
+def summarize_node_health(nodes: List[Dict[str, Any]]) -> Dict[str, Any]:
+    summary = {"healthy": 0, "maintenance": 0, "degraded": 0, "unreachable": 0}
+    for node in nodes:
+        state = node_health_state(node)
+        summary[state] = summary.get(state, 0) + 1
+    summary["total"] = len(nodes)
+    return summary
+
+
+def summarize_service_tasks(tasks: List[Dict[str, Any]]) -> Dict[str, int]:
+    summary: Dict[str, int] = {}
+    for task in tasks:
+        state = task.get("Status", {}).get("State", "unknown")
+        summary[state] = summary.get(state, 0) + 1
+    return summary
 
 
 def summarize_services() -> List[Dict[str, Any]]:
@@ -69,6 +100,7 @@ def summarize_services() -> List[Dict[str, Any]]:
         running = len([t for t in tasks if t.get("Status", {}).get("State") == "running"])
         desired = desired or len(tasks)
 
+        task_states = summarize_service_tasks(tasks)
         template = spec.get("TaskTemplate", {}).get("ContainerSpec", {})
         services.append(
             {
@@ -81,9 +113,29 @@ def summarize_services() -> List[Dict[str, Any]]:
                 "ports": attrs.get("Endpoint", {}).get("Ports", []),
                 "updated": attrs.get("UpdatedAt"),
                 "replicas": replicas,
+                "task_states": task_states,
+                "labels": template.get("Labels", {}),
             }
         )
     return services
+
+
+def evaluate_service_health(services: List[Dict[str, Any]]) -> Dict[str, Any]:
+    under_replicated = [s for s in services if s.get("desired") and s.get("running") < s.get("desired")]
+    unstable = [
+        s
+        for s in services
+        if s.get("task_states", {}).get("failed", 0) or s.get("task_states", {}).get("shutdown", 0)
+    ]
+
+    unhealthy_ids = {s.get("id") for s in under_replicated + unstable}
+
+    return {
+        "total": len(services),
+        "under_replicated": under_replicated,
+        "unstable": unstable,
+        "healthy": len(services) - len(unhealthy_ids),
+    }
 
 
 def worker_echo_rates() -> Dict[str, Any]:
@@ -122,10 +174,64 @@ def host_metrics() -> Dict[str, Any]:
     }
 
 
+def build_insights(host: Dict[str, Any], nodes: List[Dict[str, Any]], services: List[Dict[str, Any]]) -> Dict[str, Any]:
+    messages: List[Dict[str, str]] = []
+
+    # Host checks
+    if host.get("cpu_percent", 0) > 85:
+        messages.append({"level": "warn", "text": "CPU saturation detected on the host."})
+    if host.get("mem_percent", 0) > 85:
+        messages.append({"level": "warn", "text": "Memory usage is above 85%."})
+    if host.get("disk_percent", 0) > 80:
+        messages.append({"level": "warn", "text": "Disk usage is trending high."})
+    if not messages:
+        messages.append({"level": "ok", "text": "Host resources look healthy."})
+
+    # Node checks
+    node_summary = summarize_node_health(nodes)
+    if node_summary.get("unreachable"):
+        messages.append({"level": "warn", "text": f"{node_summary['unreachable']} node(s) unreachable."})
+    if node_summary.get("maintenance"):
+        messages.append({"level": "info", "text": f"{node_summary['maintenance']} node(s) in maintenance."})
+    if not node_summary.get("unreachable") and not node_summary.get("maintenance"):
+        messages.append({"level": "ok", "text": "All nodes are reachable."})
+
+    # Service checks
+    service_health = evaluate_service_health(services)
+    if service_health.get("under_replicated"):
+        affected = ", ".join(s.get("name", s.get("id")) for s in service_health["under_replicated"])
+        messages.append({"level": "warn", "text": f"Under-replicated services: {affected}."})
+    if service_health.get("unstable"):
+        affected = ", ".join(s.get("name", s.get("id")) for s in service_health["unstable"])
+        messages.append({"level": "warn", "text": f"Services with task failures: {affected}."})
+    if not service_health.get("under_replicated") and not service_health.get("unstable"):
+        messages.append({"level": "ok", "text": "Service replicas are healthy."})
+
+    version_map = {}
+    for node in nodes:
+        version = node.get("engine_version")
+        if version:
+            version_map.setdefault(version, 0)
+            version_map[version] += 1
+    if len(version_map) > 1:
+        versions = ", ".join(f"{v} ({c})" for v, c in version_map.items())
+        messages.append({"level": "warn", "text": f"Engine versions differ across nodes: {versions}."})
+
+    return {
+        "messages": messages,
+        "node_health": node_summary,
+        "service_health": service_health,
+    }
+
+
 @app.route("/api/summary")
 def summary() -> Any:
     info = client.info()
     swarm = info.get("Swarm", {})
+    nodes = collect_nodes()
+    services = summarize_services()
+    host = host_metrics()
+    insights = build_insights(host, nodes, services)
     data = {
         "cluster": {
             "node_id": swarm.get("NodeID"),
@@ -135,9 +241,10 @@ def summary() -> Any:
             "nodes": swarm.get("Nodes"),
             "cluster_info": swarm.get("Cluster", {}),
         },
-        "host": host_metrics(),
-        "nodes": collect_nodes(),
-        "services": summarize_services(),
+        "host": host,
+        "nodes": nodes,
+        "services": services,
+        "insights": insights,
         "redis_ping": worker_echo_rates(),
         "timestamp": dt.datetime.utcnow().isoformat() + "Z",
     }
