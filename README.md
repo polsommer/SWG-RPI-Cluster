@@ -65,13 +65,19 @@ sudo bash scripts/deploy-demo.sh
 ```
 
 The compose file (`stack/demo.yml`) launches:
-- **hello-app** – `traefik/whoami` with 3 replicas (one per node) on port 8080.
+- **hello-app** – `traefik/whoami` with 2 replicas (one per worker) on port 8080.
 - **redis-bus** – `redis:7-alpine` pinned to the manager with a named volume for
   durability.
 - **echo-worker** – two curl-based workers that continually hit `hello-app`
-  across the overlay network, logging responder hostname and latency.
+  across the overlay network, logging responder hostname and latency from the
+  worker nodes to avoid loading the manager.
 - **swarm-dashboard** – Flask UI on port 8081 (manager-only) that streams swarm
   health, replica counts, and Redis reachability from the Docker API.
+
+App workloads intentionally land on workers so the manager stays available for
+control-plane tasks. When you deploy your own services, add a placement
+constraint such as `node.role == worker` to keep them off the manager, or adjust
+the replica count if you add more nodes to the cluster.
 
 ### 5) Verify cross-node traffic
 - Hit the published service: `curl http://192.168.1.50:8080` (or

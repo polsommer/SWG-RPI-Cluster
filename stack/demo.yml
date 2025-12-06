@@ -8,9 +8,11 @@ services:
   hello-app:
     image: traefik/whoami:v1.10.2
     deploy:
-      replicas: 3
+      replicas: 2
       placement:
         max_replicas_per_node: 1
+        constraints:
+          - node.role == worker
     networks:
       - cluster_net
     ports:
@@ -46,6 +48,9 @@ services:
       - cluster_net
     deploy:
       replicas: 2
+      placement:
+        constraints:
+          - node.role == worker
 
   swarm-dashboard:
     image: swg-dashboard:local
