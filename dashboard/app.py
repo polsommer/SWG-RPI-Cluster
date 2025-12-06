@@ -162,6 +162,39 @@ def worker_echo_rates() -> Dict[str, Any]:
     return data
 
 
+def cluster_metrics(swarm: Dict[str, Any], nodes: List[Dict[str, Any]], services: List[Dict[str, Any]]) -> Dict[str, Any]:
+    managers = int(swarm.get("Managers") or 0)
+    total_nodes = len(nodes)
+    workers = max(total_nodes - managers, 0)
+
+    ready = len([n for n in nodes if n.get("state") in {"ready", "active"}])
+    drained = len([n for n in nodes if n.get("availability") == "drain"])
+
+    total_cpu = round(sum(n.get("cpu") or 0 for n in nodes), 2)
+    total_mem = round(sum(n.get("memory_gb") or 0 for n in nodes), 2)
+
+    total_services = len(services)
+    replicated = len([s for s in services if s.get("mode") == "replicated"])
+    global_services = len([s for s in services if s.get("mode") == "global"])
+    running_tasks = sum(s.get("running") or 0 for s in services)
+    desired_tasks = sum(s.get("desired") or 0 for s in services)
+
+    return {
+        "nodes": total_nodes,
+        "managers": managers,
+        "workers": workers,
+        "ready_nodes": ready,
+        "drained_nodes": drained,
+        "cpu_total": total_cpu,
+        "memory_total_gb": total_mem,
+        "services": total_services,
+        "replicated_services": replicated,
+        "global_services": global_services,
+        "running_tasks": running_tasks,
+        "desired_tasks": desired_tasks,
+    }
+
+
 def host_metrics() -> Dict[str, Any]:
     cpu = psutil.cpu_percent(interval=0.2)
     mem = psutil.virtual_memory()
@@ -317,6 +350,7 @@ def summary() -> Any:
     nodes = collect_nodes()
     services = summarize_services()
     host = host_metrics()
+    metrics = cluster_metrics(swarm, nodes, services)
     insights = build_insights(host, nodes, services)
     data = {
         "cluster": {
@@ -327,6 +361,7 @@ def summary() -> Any:
             "nodes": swarm.get("Nodes"),
             "cluster_info": swarm.get("Cluster", {}),
         },
+        "cluster_metrics": metrics,
         "host": host,
         "nodes": nodes,
         "services": services,
