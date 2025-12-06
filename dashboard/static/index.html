@@ -58,6 +58,12 @@
     .pill.bad { background: rgba(248,113,113,0.12); color: var(--danger); }
     .inline-input { display: flex; gap: 8px; align-items: center; }
     input[type="number"] { width: 90px; padding: 8px; border-radius: 10px; border: 1px solid var(--card-border); background: rgba(0,0,0,0.25); color: var(--text); }
+    ul { margin: 0; padding-left: 18px; }
+    .insight { display: flex; align-items: center; gap: 8px; }
+    .insight .dot { width: 10px; height: 10px; border-radius: 50%; }
+    .insight.ok .dot { background: var(--success); }
+    .insight.warn .dot { background: var(--danger); }
+    .insight.info .dot { background: var(--accent); }
     @media (max-width: 720px) { header { flex-direction: column; align-items: flex-start; } }
   </style>
 </head>
@@ -85,6 +91,11 @@
     <div class="card">
       <h3>Redis Mesh Check</h3>
       <div id="redis-card" class="stacked muted"></div>
+    </div>
+    <div class="card" style="grid-column: 1 / -1;">
+      <h3>Smart Insights</h3>
+      <div class="muted" style="margin-bottom: 8px;">Auto-curated health signals from host, nodes, and services.</div>
+      <div class="stacked" id="insights"></div>
     </div>
   </section>
 
@@ -183,6 +194,29 @@
           <td>${formatPorts(s.ports)}</td>
         </tr>`;
       }).join('');
+    }
+
+    function renderInsights(data) {
+      if (!data) {
+        $('#insights').innerHTML = '<div class="muted">No signals available yet.</div>';
+        return;
+      }
+
+      const messages = data.messages || [];
+      const nodeHealth = data.node_health || {};
+      const serviceHealth = data.service_health || {};
+
+      const breakdown = [
+        `<div><strong>Nodes</strong>: ${nodeHealth.total ?? 0} total • ${nodeHealth.healthy ?? 0} healthy • ${nodeHealth.unreachable ?? 0} unreachable</div>`,
+        `<div><strong>Services</strong>: ${serviceHealth.total ?? 0} total • ${serviceHealth.healthy ?? 0} healthy • ${(serviceHealth.under_replicated || []).length} under-replicated</div>`
+      ].join('');
+
+      $('#insights').innerHTML = `
+        <div class="muted">${breakdown}</div>
+        <ul class="stacked" style="list-style: none; padding-left: 0; gap: 6px;">
+          ${messages.map(msg => `<li class="insight ${msg.level}"><span class="dot"></span><span>${msg.text}</span></li>`).join('')}
+        </ul>
+      `;
     }
 
     function copyCommand(id) {
@@ -333,6 +367,7 @@
         const res = await fetch('/api/summary');
         const data = await res.json();
         renderSummary(data);
+        renderInsights(data.insights);
       } catch (err) {
         $('#timestamp').textContent = 'Connection lost';
         console.error(err);
