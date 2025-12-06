@@ -94,6 +94,10 @@
       <div class="stacked" id="host-card"></div>
     </div>
     <div class="card">
+      <h3>Cluster Metrics</h3>
+      <div class="stacked" id="cluster-metrics-card"></div>
+    </div>
+    <div class="card">
       <h3>Redis Mesh Check</h3>
       <div id="redis-card" class="stacked muted"></div>
     </div>
@@ -207,6 +211,16 @@
         <div><strong>Disk:</strong> ${h.disk_percent}% used</div>
         <div><strong>Uptime:</strong> ${h.uptime}</div>
         <div class="muted">Container host: ${h.hostname}</div>
+      `;
+
+      const m = data.cluster_metrics || {};
+      $('#cluster-metrics-card').innerHTML = `
+        <div><strong>Nodes:</strong> ${m.nodes ?? '-'} (${m.ready_nodes ?? 0} ready)</div>
+        <div><strong>Managers/Workers:</strong> ${m.managers ?? 0}/${m.workers ?? 0}</div>
+        <div><strong>Capacity:</strong> ${m.cpu_total ?? '-'} cores, ${m.memory_total_gb ?? '-'} GiB RAM</div>
+        <div><strong>Services:</strong> ${m.services ?? 0} (R ${m.replicated_services ?? 0} / G ${m.global_services ?? 0})</div>
+        <div><strong>Tasks:</strong> ${m.running_tasks ?? 0} running of ${m.desired_tasks ?? 0}</div>
+        <div class="muted">Drained nodes: ${m.drained_nodes ?? 0}</div>
       `;
 
       const r = data.redis_ping;
