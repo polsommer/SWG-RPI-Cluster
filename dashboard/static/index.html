@@ -73,13 +73,18 @@
       <h1>Raspberry Pi Swarm Control</h1>
       <div class="muted">Live view of nodes, services, and cluster health</div>
     </div>
-    <div class="toolbar">
+    <div class="toolbar" id="top-menu">
+      <button class="btn ghost" onclick="scrollToSection('overview')">Overview</button>
+      <button class="btn ghost" onclick="scrollToSection('nodes')">Nodes</button>
+      <button class="btn ghost" onclick="scrollToSection('services')">Services</button>
+      <button class="btn ghost" onclick="scrollToSection('control-center')">Control</button>
+      <button class="btn ghost" onclick="scrollToSection('ssh-console')">SSH</button>
       <div id="timestamp" class="pill">Loading...</div>
       <div id="admin-status" class="pill good" style="display:none;"></div>
     </div>
   </header>
 
-  <section class="grid">
+  <section class="grid" id="overview">
     <div class="card">
       <h3>Cluster</h3>
       <div class="stacked muted" id="cluster-card"></div>
@@ -99,7 +104,7 @@
     </div>
   </section>
 
-  <section class="grid" style="padding-top: 0;">
+  <section class="grid" style="padding-top: 0;" id="nodes">
     <div class="card" style="grid-column: 1 / -1;">
       <h3>Nodes</h3>
       <div class="muted" style="margin-bottom: 8px;">State, reachability, and resources</div>
@@ -110,7 +115,7 @@
     </div>
   </section>
 
-  <section class="grid" style="padding-top: 0;">
+  <section class="grid" style="padding-top: 0;" id="services">
     <div class="card" style="grid-column: 1 / -1;">
       <h3>Services</h3>
       <div class="muted" style="margin-bottom: 8px;">Replicas, images, and exposed ports</div>
@@ -121,11 +126,43 @@
     </div>
   </section>
 
-  <section class="grid" style="padding-top: 0;">
+  <section class="grid" style="padding-top: 0;" id="control-center">
     <div class="card" style="grid-column: 1 / -1;">
       <h3>Control Center</h3>
       <div class="muted" style="margin-bottom: 8px;">Join commands, token rotation, and rapid maintenance toggles.</div>
       <div class="controls" id="admin-panel"></div>
+    </div>
+  </section>
+
+  <section class="grid" style="padding-top: 0;" id="ssh-console">
+    <div class="card" style="grid-column: 1 / -1;">
+      <h3>SSH Terminal Helper</h3>
+      <div class="muted" style="margin-bottom: 8px;">Run quick commands against a node using the configured SSH key.</div>
+      <div class="stacked">
+        <div class="control-row" style="flex-wrap: wrap; gap: 12px; align-items: flex-start;">
+          <div style="flex: 1; min-width: 220px;">
+            <label for="ssh-host" class="muted">Target node</label>
+            <select id="ssh-host" style="width:100%; padding: 10px; border-radius: 10px; border: 1px solid var(--card-border); background: rgba(0,0,0,0.25); color: var(--text);">
+              <option value="">Select a node</option>
+            </select>
+          </div>
+          <div style="flex: 2; min-width: 280px;">
+            <label for="ssh-command" class="muted">Command to run</label>
+            <input id="ssh-command" type="text" placeholder="uptime" style="width:100%; padding: 12px; border-radius: 10px; border: 1px solid var(--card-border); background: rgba(0,0,0,0.25); color: var(--text);" />
+            <div class="muted" style="margin-top: 4px;">Uses non-interactive SSH with the dashboard host's keys.</div>
+          </div>
+          <div style="display:flex; align-items: flex-end;">
+            <button class="btn" onclick="runSshCommand()">Run</button>
+          </div>
+        </div>
+        <div class="control-row" style="flex-direction: column; align-items: stretch;">
+          <div class="toolbar" style="justify-content: space-between;">
+            <div><strong>Output</strong><div class="muted">stdout, stderr, and exit code</div></div>
+            <button class="btn ghost" onclick="clearSshOutput()">Clear</button>
+          </div>
+          <pre id="ssh-output" class="code" style="min-height: 120px; white-space: pre-wrap;"></pre>
+        </div>
+      </div>
     </div>
   </section>
 
@@ -134,9 +171,16 @@
   <script>
     const $ = (sel) => document.querySelector(sel);
     const REFRESH_MS = 5000;
+    let nodesCache = [];
 
     function badge(text, ok = true) {
       return `<span class="tag ${ok ? 'ok' : 'warn'}">${text}</span>`;
+    }
+
+    function scrollToSection(id) {
+      const el = document.getElementById(id);
+      if (!el) return;
+      el.scrollIntoView({ behavior: 'smooth', block: 'start' });
     }
 
     function formatPorts(ports) {
@@ -173,6 +217,8 @@
       `;
 
       const nodes = data.nodes || [];
+      nodesCache = nodes;
+      populateSshNodes(nodes);
       $('#nodes-table tbody').innerHTML = nodes.map(n => `
         <tr>
           <td><strong>${n.hostname}</strong><div class="muted">${n.addr || ''}</div></td>
@@ -311,6 +357,67 @@
 
     function copySsh(cmd) {
       navigator.clipboard.writeText(cmd).then(() => setStatus('SSH command copied', true));
+    }
+
+    function populateSshNodes(nodes) {
+      const select = document.getElementById('ssh-host');
+      if (!select) return;
+      const current = select.value;
+      const options = ['<option value="">Select a node</option>']
+        .concat(nodes
+          .filter(n => n.addr)
+          .map(n => `<option value="${n.addr}" ${current === n.addr ? 'selected' : ''}>${n.hostname} (${n.addr})</option>`));
+      select.innerHTML = options.join('');
+    }
+
+    function setSshOutput(text) {
+      const out = document.getElementById('ssh-output');
+      if (out) out.textContent = text || '';
+    }
+
+    function clearSshOutput() {
+      setSshOutput('');
+    }
+
+    async function runSshCommand() {
+      const host = document.getElementById('ssh-host')?.value;
+      const command = document.getElementById('ssh-command')?.value;
+      if (!host) {
+        setStatus('Select a node first', false);
+        return;
+      }
+      if (!command) {
+        setStatus('Enter a command to run', false);
+        return;
+      }
+
+      setSshOutput('Running...');
+      try {
+        const res = await fetch('/api/admin/ssh-run', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ host, command })
+        });
+        const payload = await res.json();
+        if (!res.ok || payload.error) {
+          const message = payload.error || 'Command failed';
+          setStatus(message, false);
+          setSshOutput(message);
+          return;
+        }
+        const { stdout, stderr, return_code } = payload;
+        const lines = [];
+        lines.push(`Host: ${host}`);
+        lines.push(`Exit code: ${return_code}`);
+        if (stdout) lines.push(`\nSTDOUT:\n${stdout}`);
+        if (stderr) lines.push(`\nSTDERR:\n${stderr}`);
+        setSshOutput(lines.join('\n'));
+        setStatus('SSH command completed', return_code === 0);
+      } catch (err) {
+        console.error(err);
+        setStatus('Unable to run SSH command', false);
+        setSshOutput('Error running command');
+      }
     }
 
     async function scaleService(serviceId, inputId) {
