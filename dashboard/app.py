@@ -4,14 +4,17 @@ import datetime as dt
 import os
 import socket
 import time
+from pathlib import Path
 from typing import Any, Dict, List
 
 import docker
 import psutil
 from flask import Flask, jsonify, request, send_from_directory
+from subprocess import CalledProcessError, CompletedProcess, run
 
 app = Flask(__name__, static_folder="static", static_url_path="")
 client = docker.from_env()
+REPO_ROOT = Path(__file__).resolve().parents[1]
 
 
 def format_duration(seconds: float) -> str:
@@ -45,12 +48,14 @@ def collect_nodes() -> List[Dict[str, Any]]:
                 "availability": spec.get("Availability"),
                 "role": spec.get("Role"),
                 "reachability": manager.get("Reachability"),
+                "manager_addr": manager.get("Addr"),
                 "cpu": resources.get("NanoCPUs", 0) / 1e9,
                 "memory_gb": round(resources.get("MemoryBytes", 0) / 1024 / 1024 / 1024, 2),
                 "engine_version": desc.get("Engine", {}).get("EngineVersion"),
                 "last_heartbeat": manager.get("LastHeartbeat"),
                 "platform": desc.get("Platform", {}).get("Architecture"),
                 "os": desc.get("Platform", {}).get("OS"),
+                "labels": spec.get("Labels", {}),
             }
         )
     return nodes
@@ -174,6 +179,36 @@ def host_metrics() -> Dict[str, Any]:
     }
 
 
+def git_command(args: List[str]) -> CompletedProcess[str]:
+    return run(args, cwd=REPO_ROOT, capture_output=True, text=True, check=True)
+
+
+def repo_update_status(apply: bool = False) -> Dict[str, Any]:
+    try:
+        git_command(["git", "fetch", "origin"])
+        branch = git_command(["git", "rev-parse", "--abbrev-ref", "HEAD"]).stdout.strip()
+        local_rev = git_command(["git", "rev-parse", "HEAD"]).stdout.strip()
+        upstream = git_command(["git", "rev-parse", f"origin/{branch}"]).stdout.strip()
+        ahead_behind = git_command(["git", "rev-list", "--left-right", "--count", f"HEAD...origin/{branch}"]).stdout.strip()
+        behind = int(ahead_behind.split()[1]) if " " in ahead_behind else 0
+        output = ""
+
+        if apply and behind > 0:
+            result = git_command(["git", "pull", "--rebase", "origin", branch])
+            output = result.stdout + result.stderr
+
+        return {
+            "branch": branch,
+            "local": local_rev,
+            "remote": upstream,
+            "behind": behind,
+            "applied": apply and behind > 0,
+            "output": output or None,
+        }
+    except (CalledProcessError, FileNotFoundError) as exc:  # noqa: PERF203
+        return {"error": str(exc), "applied": False}
+
+
 def build_insights(host: Dict[str, Any], nodes: List[Dict[str, Any]], services: List[Dict[str, Any]]) -> Dict[str, Any]:
     messages: List[Dict[str, str]] = []
 
@@ -265,6 +300,7 @@ def admin() -> Any:
             "nodes": collect_nodes(),
             "services": summarize_services(),
             "cluster": swarm,
+            "repo": repo_update_status(False),
         }
     )
 
@@ -296,6 +332,42 @@ def set_node_availability(node_id: str) -> Any:
         return jsonify({"error": str(exc)}), 500
 
 
+@app.post("/api/nodes/<node_id>/role")
+def set_node_role(node_id: str) -> Any:
+    payload = request.get_json(silent=True) or {}
+    role = str(payload.get("role", "")).lower()
+    if role not in {"manager", "worker"}:
+        return jsonify({"error": "role must be one of: manager, worker"}), 400
+
+    try:
+        node = client.nodes.get(node_id)
+        spec = dict(node.attrs.get("Spec", {}))
+        spec["Role"] = role
+        node.update(spec)
+        return jsonify({"ok": True, "node_id": node_id, "role": role})
+    except Exception as exc:  # noqa: BLE001
+        return jsonify({"error": str(exc)}), 500
+
+
+@app.post("/api/nodes/<node_id>/labels")
+def set_node_labels(node_id: str) -> Any:
+    payload = request.get_json(silent=True) or {}
+    labels = payload.get("labels", {})
+    if not isinstance(labels, dict):
+        return jsonify({"error": "labels must be an object"}), 400
+
+    try:
+        node = client.nodes.get(node_id)
+        spec = dict(node.attrs.get("Spec", {}))
+        current_labels = spec.get("Labels", {}) or {}
+        current_labels.update({str(k): str(v) for k, v in labels.items()})
+        spec["Labels"] = current_labels
+        node.update(spec)
+        return jsonify({"ok": True, "node_id": node_id, "labels": current_labels})
+    except Exception as exc:  # noqa: BLE001
+        return jsonify({"error": str(exc)}), 500
+
+
 @app.post("/api/services/<service_id>/scale")
 def scale_service(service_id: str) -> Any:
     payload = request.get_json(silent=True) or {}
@@ -318,6 +390,20 @@ def scale_service(service_id: str) -> Any:
         return jsonify({"ok": True, "service": service_id, "replicas": replicas_int})
     except Exception as exc:  # noqa: BLE001
         return jsonify({"error": str(exc)}), 500
+
+
+@app.get("/api/admin/repo-status")
+def repo_status() -> Any:
+    return jsonify(repo_update_status(False))
+
+
+@app.post("/api/admin/update")
+def apply_update() -> Any:
+    payload = request.get_json(silent=True) or {}
+    apply = bool(payload.get("apply", True))
+    status = repo_update_status(apply)
+    code = 200 if status.get("error") is None else 500
+    return jsonify(status), code
 
 
 @app.route("/")
