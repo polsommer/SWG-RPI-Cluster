@@ -1,0 +1,66 @@
+version: "3.9"
+
+networks:
+  cluster_net:
+    external: true
+
+services:
+  hello-app:
+    image: traefik/whoami:v1.10.2
+    deploy:
+      replicas: 3
+      placement:
+        max_replicas_per_node: 1
+    networks:
+      - cluster_net
+    ports:
+      - "8080:80"
+    environment:
+      - WHOAMI_NAME={{.Task.Name}}
+      - WHOAMI_HOSTNAME={{.Node.Hostname}}
+
+  redis-bus:
+    image: redis:7-alpine
+    command: ["redis-server", "--appendonly", "yes"]
+    volumes:
+      - redis-data:/data
+    networks:
+      - cluster_net
+    deploy:
+      placement:
+        constraints:
+          - node.role == manager
+
+  echo-worker:
+    image: curlimages/curl:8.8.0
+    command:
+      - /bin/sh
+      - -c
+      - |
+        while true; do
+          echo "---- $(date) ----"
+          curl -sw "status=%{http_code} host=%{remote_ip} connect=%{time_connect}s total=%{time_total}s\n" hello-app:80 || true
+          sleep 5
+        done
+    networks:
+      - cluster_net
+    deploy:
+      replicas: 2
+
+  swarm-dashboard:
+    image: swg-dashboard:local
+    networks:
+      - cluster_net
+    environment:
+      - OVERLAY_NETWORK=cluster_net
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    ports:
+      - "8081:8081"
+    deploy:
+      placement:
+        constraints:
+          - node.role == manager
+
+volumes:
+  redis-data:

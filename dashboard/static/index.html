@@ -1,0 +1,177 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Pi Swarm Dashboard</title>
+  <style>
+    :root {
+      color-scheme: light dark;
+      --bg: #0f172a;
+      --card: #1e293b;
+      --text: #e2e8f0;
+      --muted: #94a3b8;
+      --accent: #22d3ee;
+      --danger: #f87171;
+      --success: #34d399;
+      font-family: "Inter", system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    }
+    body {
+      margin: 0;
+      background: radial-gradient(circle at 10% 10%, rgba(34,211,238,0.12), transparent 25%),
+        radial-gradient(circle at 90% 20%, rgba(52,211,153,0.14), transparent 22%),
+        var(--bg);
+      color: var(--text);
+    }
+    header {
+      padding: 24px 32px 12px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+    }
+    h1 { margin: 0; font-size: 1.6rem; }
+    .pill { padding: 6px 12px; border-radius: 999px; background: rgba(34,211,238,0.16); color: var(--accent); font-weight: 600; }
+    .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); gap: 16px; padding: 0 32px 32px; }
+    .card { background: linear-gradient(145deg, rgba(255,255,255,0.04), rgba(0,0,0,0.2)); border: 1px solid rgba(255,255,255,0.05); border-radius: 14px; padding: 16px; box-shadow: 0 20px 60px rgba(0,0,0,0.35); }
+    .card h3 { margin: 0 0 8px; }
+    .muted { color: var(--muted); }
+    table { width: 100%; border-collapse: collapse; font-size: 0.95rem; }
+    th, td { text-align: left; padding: 8px 6px; border-bottom: 1px solid rgba(255,255,255,0.07); }
+    th { color: var(--muted); font-weight: 600; }
+    .tag { padding: 4px 8px; border-radius: 8px; font-weight: 600; font-size: 0.85rem; }
+    .tag.ok { background: rgba(52,211,153,0.16); color: var(--success); }
+    .tag.warn { background: rgba(248,113,113,0.12); color: var(--danger); }
+    .stacked { display: grid; gap: 6px; }
+    .footer { text-align: center; padding: 12px; color: var(--muted); font-size: 0.9rem; }
+    @media (max-width: 720px) { header { flex-direction: column; align-items: flex-start; } }
+  </style>
+</head>
+<body>
+  <header>
+    <div>
+      <h1>Raspberry Pi Swarm Control</h1>
+      <div class="muted">Live view of nodes, services, and cluster health</div>
+    </div>
+    <div id="timestamp" class="pill">Loading...</div>
+  </header>
+
+  <section class="grid">
+    <div class="card">
+      <h3>Cluster</h3>
+      <div class="stacked muted" id="cluster-card"></div>
+    </div>
+    <div class="card">
+      <h3>Host Metrics</h3>
+      <div class="stacked" id="host-card"></div>
+    </div>
+    <div class="card">
+      <h3>Redis Mesh Check</h3>
+      <div id="redis-card" class="stacked muted"></div>
+    </div>
+  </section>
+
+  <section class="grid" style="padding-top: 0;">
+    <div class="card" style="grid-column: 1 / -1;">
+      <h3>Nodes</h3>
+      <div class="muted" style="margin-bottom: 8px;">State, reachability, and resources</div>
+      <table id="nodes-table">
+        <thead><tr><th>Node</th><th>Role</th><th>Status</th><th>CPU</th><th>Memory</th><th>Version</th></tr></thead>
+        <tbody></tbody>
+      </table>
+    </div>
+  </section>
+
+  <section class="grid" style="padding-top: 0;">
+    <div class="card" style="grid-column: 1 / -1;">
+      <h3>Services</h3>
+      <div class="muted" style="margin-bottom: 8px;">Replicas, images, and exposed ports</div>
+      <table id="services-table">
+        <thead><tr><th>Name</th><th>Image</th><th>Mode</th><th>Replicas</th><th>Ports</th></tr></thead>
+        <tbody></tbody>
+      </table>
+    </div>
+  </section>
+
+  <div class="footer">Auto-refreshing every 5s • Powered by Docker SDK &amp; Flask</div>
+
+  <script>
+    const $ = (sel) => document.querySelector(sel);
+
+    function badge(text, ok = true) {
+      return `<span class="tag ${ok ? 'ok' : 'warn'}">${text}</span>`;
+    }
+
+    function formatPorts(ports) {
+      if (!ports || !ports.length) return '<span class="muted">-</span>';
+      return ports.map(p => `${p.PublishedPort || ''}:${p.TargetPort}/${p.Protocol || 'tcp'}`).join(', ');
+    }
+
+    function renderSummary(data) {
+      $('#timestamp').textContent = `Updated ${new Date(data.timestamp).toLocaleTimeString()}`;
+
+      const c = data.cluster;
+      $('#cluster-card').innerHTML = `
+        <div><strong>Node ID:</strong> <span class="muted">${c.node_id || 'n/a'}</span></div>
+        <div><strong>Managers:</strong> ${c.managers ?? '-'} • <strong>Workers:</strong> ${(c.nodes ?? 0) - (c.managers ?? 0)}</div>
+        <div><strong>State:</strong> ${badge(c.local_node_state || 'unknown', c.local_node_state === 'active')}</div>
+        <div><strong>Control available:</strong> ${badge(c.control_available ? 'Yes' : 'No', !!c.control_available)}</div>
+      `;
+
+      const h = data.host;
+      $('#host-card').innerHTML = `
+        <div><strong>CPU:</strong> ${h.cpu_percent}%</div>
+        <div><strong>Memory:</strong> ${h.mem_percent}% of ${h.mem_total_gb} GiB</div>
+        <div><strong>Load:</strong> ${h.load.join(', ')}</div>
+        <div><strong>Disk:</strong> ${h.disk_percent}% used</div>
+        <div><strong>Uptime:</strong> ${h.uptime}</div>
+        <div class="muted">Container host: ${h.hostname}</div>
+      `;
+
+      const r = data.redis_ping;
+      $('#redis-card').innerHTML = `
+        <div><strong>Target:</strong> ${r.redis}</div>
+        <div><strong>Reachable:</strong> ${badge(r.reachable ? 'OK' : 'Down', !!r.reachable)}</div>
+        <div><strong>Ping:</strong> ${r.ping_ms ? r.ping_ms.toFixed(1) + ' ms' : 'n/a'}</div>
+      `;
+
+      const nodes = data.nodes || [];
+      $('#nodes-table tbody').innerHTML = nodes.map(n => `
+        <tr>
+          <td><strong>${n.hostname}</strong><div class="muted">${n.addr || ''}</div></td>
+          <td>${n.role}</td>
+          <td>${badge(n.state || 'unknown', n.state === 'ready' || n.state === 'active')} ${n.reachability ? `<span class="muted">${n.reachability}</span>` : ''}</td>
+          <td>${n.cpu ? n.cpu.toFixed(1) + ' cores' : '-'}</td>
+          <td>${n.memory_gb ? n.memory_gb + ' GiB' : '-'}</td>
+          <td>${n.engine_version || '-'}</td>
+        </tr>`).join('');
+
+      const services = data.services || [];
+      $('#services-table tbody').innerHTML = services.map(s => {
+        const ok = s.running === s.desired;
+        return `<tr>
+          <td><strong>${s.name}</strong><div class="muted">${s.id}</div></td>
+          <td>${s.image}</td>
+          <td>${s.mode}</td>
+          <td>${badge(`${s.running}/${s.desired}`, ok)}</td>
+          <td>${formatPorts(s.ports)}</td>
+        </tr>`;
+      }).join('');
+    }
+
+    async function refresh() {
+      try {
+        const res = await fetch('/api/summary');
+        const data = await res.json();
+        renderSummary(data);
+      } catch (err) {
+        $('#timestamp').textContent = 'Connection lost';
+        console.error(err);
+      }
+    }
+
+    refresh();
+    setInterval(refresh, 5000);
+  </script>
+</body>
+</html>
