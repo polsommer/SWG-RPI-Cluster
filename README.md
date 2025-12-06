@@ -112,3 +112,9 @@ docker stack rm swg-demo
 
 The overlay network `cluster_net` is created once and reused; remove it with
 `docker network rm cluster_net` if you want a full cleanup.
+
+## Deploying the swarm dashboard by itself
+The Flask-based UI can be deployed without the demo services if you only need a
+live swarm view. See [dashboard/README.md](dashboard/README.md) for a
+step-by-step guide that covers building the image, wiring up `cluster_net`, and
+deploying the service with a one-liner stack file.
