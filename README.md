@@ -13,7 +13,8 @@ process repeatable on fresh or recycled Pis.
 
 ## What you need
 - Three Raspberry Pi boards with a 64-bit OS, SSH enabled, and static/reserved
-  IP addresses
+  IP addresses (example: manager `192.168.88.7`, workers `192.168.88.5` and
+  `192.168.88.8`)
 - A shared LAN plus consistent hostnames (examples: `pi-manager`,
   `pi-worker1`, `pi-worker2`)
 - `sudo` access on every node
@@ -33,10 +34,11 @@ Reboot once so the added cgroup flags in `/boot/cmdline.txt` take effect. The
 script is safe to rerun whenever you add or rebuild a node.
 
 ### 2) Initialize the swarm (manager)
-On `pi-manager` (swap in your preferred advertise IP if needed):
+On `pi-manager` (swap in your preferred advertise IP if needed; the examples
+below use `192.168.88.7`):
 
 ```bash
-sudo bash scripts/init-swarm.sh 192.168.1.50
+sudo bash scripts/init-swarm.sh 192.168.88.7
 ```
 
 You’ll see **manager** and **worker** join tokens plus the advertise address
@@ -47,7 +49,7 @@ membership details instead of reinitializing.
 On `pi-worker1` and `pi-worker2`, supply the worker token and manager IP:
 
 ```bash
-sudo bash scripts/join-swarm.sh 192.168.1.50 SWMTKN-1-...
+sudo bash scripts/join-swarm.sh 192.168.88.7 SWMTKN-1-...
 ```
 
 If a worker is already in a swarm, leave first with `docker swarm leave --force`
@@ -80,9 +82,9 @@ constraint such as `node.role == worker` to keep them off the manager, or adjust
 the replica count if you add more nodes to the cluster.
 
 ### 5) Verify cross-node traffic
-- Hit the published service: `curl http://192.168.1.50:8080` (or
+- Hit the published service: `curl http://192.168.88.7:8080` (or
   `http://pi-manager.local:8080`). The `Hostname` should vary between nodes.
-- Open the dashboard at `http://192.168.1.50:8081` for live metrics and overlay
+- Open the dashboard at `http://192.168.88.7:8081` for live metrics and overlay
   checks.
 - Watch the worker logs from inside the cluster:
 
