@@ -184,6 +184,13 @@ textures to a dedicated Git repository (for example, an `HDtextureDDS` repo).
   LOG_FILE=/var/log/texture-export.log
   ```
 
+- **Syncing to the `polsommer/HDtextureDDS` repo:** set
+  `GIT_REMOTE_URL=https://github.com/polsommer/HDtextureDDS.git` (or the SSH
+  equivalent) and `GIT_BRANCH=main` in your `.env`. On the first run, the script
+  clones the existing history into `EXPORT_DIR` before watching for new assets,
+  preserving the repo’s commit lineage while automatically pushing subsequent
+  renders from the cluster.
+
 - **Running manually:**
 
   ```bash
