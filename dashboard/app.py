@@ -4,6 +4,7 @@ import atexit
 import base64
 import datetime as dt
 import json
+import queue
 import os
 import shutil
 import socket
@@ -33,7 +34,9 @@ except DockerException as exc:  # pragma: no cover - exercised in tests
     client = _UnavailableDockerClient()
 REPO_ROOT = Path(__file__).resolve().parents[1]
 METRICS_STORE = Path(os.environ.get("METRICS_STORE", "/tmp/service_metrics.json"))
+STATE_STORE = Path(os.environ.get("DASHBOARD_STATE_STORE", "/tmp/dashboard_state.json"))
 METRICS_LOCK = threading.Lock()
+STATE_LOCK = threading.Lock()
 AUTH_TOKEN = os.environ.get("DASHBOARD_AUTH_TOKEN", "").strip()
 PROTECTED_PATH_PREFIXES = ("/api/admin", "/api/nodes", "/api/services")
 CONTROLLER_LOCK_FILE = Path(os.environ.get("DASHBOARD_CONTROLLER_LOCK", "/tmp/dashboard_controller.lock"))
@@ -93,6 +96,42 @@ def _persist_metrics_store(store: Dict[str, Any]) -> None:
             json.dump(store, fh, indent=2)
 
 
+def _load_state_store() -> Dict[str, Any]:
+    if not STATE_STORE.exists():
+        return {}
+
+    try:
+        with STATE_LOCK:
+            with STATE_STORE.open() as fh:
+                return json.load(fh) or {}
+    except Exception:  # noqa: BLE001
+        return {}
+
+
+def _persist_state_store(store: Dict[str, Any]) -> None:
+    STATE_STORE.parent.mkdir(parents=True, exist_ok=True)
+    with STATE_LOCK:
+        with STATE_STORE.open("w") as fh:
+            json.dump(store, fh, indent=2)
+
+
+def _persist_swarm_state(tokens: Dict[str, Any] | None, advertise_addr: str | None) -> Dict[str, Any]:
+    store = _load_state_store()
+    swarm_state = store.get("swarm", {})
+    if tokens:
+        swarm_state["tokens"] = tokens
+    if advertise_addr:
+        swarm_state["advertise_addr"] = advertise_addr
+    store["swarm"] = swarm_state
+    _persist_state_store(store)
+    return swarm_state
+
+
+def load_swarm_state() -> Dict[str, Any]:
+    store = _load_state_store()
+    return store.get("swarm", {}) if isinstance(store, dict) else {}
+
+
 def exponential_smoothing(values: List[float], alpha: float, default: float | None = None) -> float | None:
     if not values:
         return default
@@ -128,6 +167,44 @@ remediation_thread_started = False
 scaler_thread_started = False
 scale_events: deque[Dict[str, Any]] = deque(maxlen=100)
 controller_lock = threading.Lock()
+onboarding_lock = threading.Lock()
+onboarding_logs: deque[Dict[str, Any]] = deque(maxlen=500)
+onboarding_state: Dict[str, Any] = {
+    "status": "idle",
+    "manager": None,
+    "workers": [],
+    "ssh_user": "pi",
+    "ssh_key_path": None,
+    "advertise_addr": None,
+    "started_at": None,
+    "updated_at": None,
+    "error": None,
+    "validation": None,
+    "tokens": {},
+}
+
+
+class BackgroundTaskRunner:
+    def __init__(self) -> None:
+        self.queue: "queue.Queue[tuple]" = queue.Queue()
+        self.thread = threading.Thread(target=self._worker, daemon=True)
+        self.thread.start()
+
+    def submit(self, func, *args, **kwargs) -> None:  # type: ignore[no-untyped-def]
+        self.queue.put((func, args, kwargs))
+
+    def _worker(self) -> None:
+        while True:
+            func, args, kwargs = self.queue.get()
+            try:
+                func(*args, **kwargs)
+            except Exception as exc:  # noqa: BLE001
+                app.logger.exception("Background task failed: %s", exc)
+            finally:
+                self.queue.task_done()
+
+
+task_runner = BackgroundTaskRunner()
 
 
 def format_duration(seconds: float) -> str:
@@ -141,6 +218,34 @@ def format_duration(seconds: float) -> str:
         return f"{hours}h {minutes}m"
     days, hours = divmod(hours, 24)
     return f"{days}d {hours}h"
+
+
+def onboarding_snapshot() -> Dict[str, Any]:
+    with onboarding_lock:
+        state = dict(onboarding_state)
+        state["logs"] = list(onboarding_logs)
+    return state
+
+
+def record_onboarding_log(target: str, message: str, level: str = "info") -> None:
+    entry = {
+        "ts": dt.datetime.utcnow().isoformat() + "Z",
+        "target": target,
+        "level": level,
+        "message": message,
+    }
+    with onboarding_lock:
+        onboarding_logs.append(entry)
+        onboarding_state["updated_at"] = entry["ts"]
+
+
+def set_onboarding_state(**changes: Any) -> Dict[str, Any]:
+    with onboarding_lock:
+        onboarding_state.update(changes)
+        onboarding_state["updated_at"] = dt.datetime.utcnow().isoformat() + "Z"
+        state = dict(onboarding_state)
+        state["logs"] = list(onboarding_logs)
+    return state
 
 
 def collect_nodes() -> List[Dict[str, Any]]:
@@ -777,6 +882,189 @@ def execute_ssh_command(host: str, command: str, allowed_hosts: List[str]) -> Tu
     return payload, status
 
 
+def _ssh_base_command(host: str, user: str, key_path: str | None) -> List[str]:
+    cmd = ["ssh", "-o", "StrictHostKeyChecking=no"]
+    if key_path:
+        cmd.extend(["-i", key_path])
+    cmd.append(f"{user}@{host}")
+    return cmd
+
+
+def run_remote_command(
+    host: str, user: str, key_path: str | None, remote_command: List[str], input_data: str | None = None
+) -> CompletedProcess[str]:
+    try:
+        return run(
+            _ssh_base_command(host, user, key_path) + remote_command,
+            capture_output=True,
+            text=True,
+            timeout=180,
+            input=input_data,
+            check=False,
+        )
+    except Exception as exc:  # noqa: BLE001
+        return CompletedProcess(args=remote_command, returncode=1, stdout="", stderr=str(exc))
+
+
+def run_remote_script(host: str, user: str, key_path: str | None, script_path: Path, args: List[str] | None = None) -> CompletedProcess[str]:
+    if not script_path.exists():
+        return CompletedProcess(args=[], returncode=1, stdout="", stderr=f"Script not found: {script_path}")
+
+    script_body = script_path.read_text()
+    remote_cmd = ["bash", "-s", "--"] + list(args or [])
+    return run_remote_command(host, user, key_path, remote_cmd, script_body)
+
+
+def fetch_remote_swarm_facts(host: str, user: str, key_path: str | None) -> Dict[str, Any]:
+    result = run_remote_command(host, user, key_path, ["docker", "info", "--format", "{{json .Swarm}}"])
+    facts: Dict[str, Any] = {"return_code": result.returncode}
+    if result.returncode != 0 or not result.stdout:
+        facts["stderr"] = result.stderr
+        return facts
+
+    try:
+        swarm_info = json.loads(result.stdout)
+    except json.JSONDecodeError:
+        facts["stderr"] = "Unable to parse swarm info"
+        return facts
+
+    tokens = swarm_info.get("JoinTokens", {})
+    managers = swarm_info.get("RemoteManagers", [])
+    advertise_addr = managers[0].get("Addr") if managers else None
+
+    facts.update({"tokens": tokens, "advertise_addr": advertise_addr})
+    return facts
+
+
+def verify_swarm_health(
+    manager_host: str, user: str, key_path: str | None, expected_nodes: int | None, advertise_addr: str | None
+) -> Dict[str, Any]:
+    summary: Dict[str, Any] = {"nodes": [], "overlay": False}
+    listing = run_remote_command(
+        manager_host,
+        user,
+        key_path,
+        [
+            "docker",
+            "node",
+            "ls",
+            "--format",
+            "{{.Hostname}} {{.Status}} {{.Availability}} {{.ManagerStatus}}",
+        ],
+    )
+    if listing.stdout:
+        for line in listing.stdout.splitlines():
+            parts = line.split()
+            summary["nodes"].append(
+                {
+                    "hostname": parts[0] if parts else "",
+                    "status": parts[1] if len(parts) > 1 else "",
+                    "availability": parts[2] if len(parts) > 2 else "",
+                    "manager": parts[3] if len(parts) > 3 else "",
+                }
+            )
+
+    network = run_remote_command(
+        manager_host,
+        user,
+        key_path,
+        ["docker", "network", "ls", "--filter", "name=cluster_net", "--format", "{{.Name}}"],
+    )
+    summary["overlay"] = "cluster_net" in [n.strip() for n in network.stdout.splitlines() if n.strip()]
+
+    ready_nodes = [n for n in summary.get("nodes", []) if n.get("status", "").lower() == "ready"]
+    target_nodes = expected_nodes or len(summary.get("nodes", []))
+    summary["expected_nodes"] = target_nodes
+    summary["ready_nodes"] = len(ready_nodes)
+    summary["network_check"] = network.returncode == 0
+    summary["node_check"] = listing.returncode == 0 and summary["ready_nodes"] >= target_nodes
+    summary["advertise_addr"] = advertise_addr
+    summary["ok"] = summary["network_check"] and summary["node_check"] and summary["overlay"]
+    return summary
+
+
+def run_onboarding_flow(
+    manager_host: str,
+    worker_hosts: List[str],
+    ssh_user: str,
+    key_path: str | None,
+    advertise_addr: str | None,
+) -> None:
+    with onboarding_lock:
+        onboarding_logs.clear()
+    set_onboarding_state(
+        status="running",
+        manager=manager_host,
+        workers=worker_hosts,
+        ssh_user=ssh_user,
+        ssh_key_path=key_path,
+        advertise_addr=advertise_addr or manager_host,
+        started_at=dt.datetime.utcnow().isoformat() + "Z",
+        error=None,
+        validation=None,
+    )
+
+    scripts_dir = REPO_ROOT / "scripts"
+    record_onboarding_log(manager_host, "Installing Docker on manager via install-docker.sh")
+    result = run_remote_script(manager_host, ssh_user, key_path, scripts_dir / "install-docker.sh")
+    if result.returncode != 0:
+        set_onboarding_state(status="error", error=result.stderr or "Manager install failed")
+        return
+
+    record_onboarding_log(manager_host, "Initializing swarm using init-swarm.sh")
+    init_args = [advertise_addr] if advertise_addr else []
+    init_result = run_remote_script(manager_host, ssh_user, key_path, scripts_dir / "init-swarm.sh", init_args)
+    if init_result.returncode != 0:
+        set_onboarding_state(status="error", error=init_result.stderr or "Swarm init failed")
+        return
+
+    facts = fetch_remote_swarm_facts(manager_host, ssh_user, key_path)
+    tokens = facts.get("tokens", {}) if isinstance(facts.get("tokens"), dict) else {}
+    advertise_addr = facts.get("advertise_addr") or advertise_addr or manager_host
+    if tokens:
+        record_onboarding_log(manager_host, "Captured swarm join tokens from manager")
+    persist = _persist_swarm_state(tokens, advertise_addr)
+    set_onboarding_state(tokens=persist.get("tokens", {}), advertise_addr=persist.get("advertise_addr"))
+
+    for host in worker_hosts:
+        record_onboarding_log(host, "Installing Docker on worker via install-docker.sh")
+        worker_install = run_remote_script(host, ssh_user, key_path, scripts_dir / "install-docker.sh")
+        if worker_install.returncode != 0:
+            set_onboarding_state(status="error", error=worker_install.stderr or f"Install failed on {host}")
+            return
+
+        join_token = tokens.get("Worker") if tokens else None
+        if not join_token:
+            record_onboarding_log(host, "Worker token unavailable; cannot join swarm", level="warn")
+            set_onboarding_state(status="error", error="Worker token unavailable")
+            return
+
+        record_onboarding_log(host, "Joining swarm via join-swarm.sh")
+        join_result = run_remote_script(
+            host,
+            ssh_user,
+            key_path,
+            scripts_dir / "join-swarm.sh",
+            [advertise_addr, join_token],
+        )
+        if join_result.returncode != 0:
+            set_onboarding_state(status="error", error=join_result.stderr or f"Join failed for {host}")
+            return
+
+    # Health checks with retries
+    validation: Dict[str, Any] | None = None
+    for _ in range(3):
+        validation = verify_swarm_health(manager_host, ssh_user, key_path, len(worker_hosts) + 1, advertise_addr)
+        set_onboarding_state(validation=validation)
+        if validation.get("ok"):
+            break
+        time.sleep(5)
+
+    final_status = "ready" if validation and validation.get("ok") else "running"
+    set_onboarding_state(status=final_status, validation=validation)
+    record_onboarding_log(manager_host, "Onboarding complete" if final_status == "ready" else "Health checks pending")
+
+
 def build_insights(host: Dict[str, Any], nodes: List[Dict[str, Any]], services: List[Dict[str, Any]]) -> Dict[str, Any]:
     messages: List[Dict[str, str]] = []
 
@@ -886,10 +1174,17 @@ def summary() -> Any:
 
 @app.route("/api/admin")
 def admin() -> Any:
-    swarm = client.api.inspect_swarm()
-    join_tokens = swarm.get("JoinTokens", {})
-    managers = client.info().get("Swarm", {}).get("RemoteManagers", [])
-    advertise_addr = managers[0].get("Addr") if managers else None
+    stored_swarm = load_swarm_state()
+    try:
+        swarm = client.api.inspect_swarm()
+        join_tokens = swarm.get("JoinTokens", {}) or stored_swarm.get("tokens", {})
+        managers = client.info().get("Swarm", {}).get("RemoteManagers", [])
+        advertise_addr = managers[0].get("Addr") if managers else stored_swarm.get("advertise_addr")
+        _persist_swarm_state(join_tokens, advertise_addr)
+    except Exception:  # noqa: BLE001
+        swarm = {}
+        join_tokens = stored_swarm.get("tokens", {}) if isinstance(stored_swarm, dict) else {}
+        advertise_addr = stored_swarm.get("advertise_addr") if isinstance(stored_swarm, dict) else None
     services = summarize_services()
 
     return jsonify(
@@ -903,8 +1198,52 @@ def admin() -> Any:
             "forecasts": build_forecast_snapshot(services),
             "autoscaler_events": list(scale_events),
             "llm": texture_llm_status(),
+            "onboarding": onboarding_snapshot(),
         }
     )
+
+
+@app.get("/api/admin/onboarding/status")
+def onboarding_status() -> Any:
+    return jsonify(onboarding_snapshot())
+
+
+@app.post("/api/admin/onboarding/start")
+def onboarding_start() -> Any:
+    payload = request.get_json(silent=True) or {}
+    manager_host = str(payload.get("manager", "")).strip()
+    raw_workers = payload.get("workers") or []
+    if isinstance(raw_workers, str):
+        combined = []
+        for part in raw_workers.splitlines():
+            combined.extend(segment.strip() for segment in part.split(","))
+        raw_workers = combined
+    worker_hosts = [str(w).strip() for w in raw_workers if str(w).strip()]
+    ssh_user = str(payload.get("ssh_user", "pi") or "pi").strip()
+    key_path = str(payload.get("ssh_key_path") or "").strip() or None
+    advertise_addr = str(payload.get("advertise_addr") or "").strip() or manager_host
+
+    if not manager_host:
+        return jsonify({"error": "manager is required"}), 400
+
+    with onboarding_lock:
+        if onboarding_state.get("status") == "running":
+            return jsonify({"error": "Onboarding already running"}), 409
+
+    set_onboarding_state(
+        status="queued",
+        manager=manager_host,
+        workers=worker_hosts,
+        ssh_user=ssh_user,
+        ssh_key_path=key_path,
+        advertise_addr=advertise_addr,
+        tokens=load_swarm_state().get("tokens", {}),
+        error=None,
+        validation=None,
+    )
+    record_onboarding_log(manager_host, "Queued onboarding workflow")
+    task_runner.submit(run_onboarding_flow, manager_host, worker_hosts, ssh_user, key_path, advertise_addr)
+    return jsonify(onboarding_snapshot())
 
 
 @app.post("/api/admin/rotate-tokens")
@@ -912,7 +1251,11 @@ def rotate_tokens() -> Any:
     try:
         client.swarm.update(rotate_manager_token=True, rotate_worker_token=True)
         swarm = client.api.inspect_swarm()
-        return jsonify({"tokens": swarm.get("JoinTokens", {})})
+        tokens = swarm.get("JoinTokens", {})
+        managers = client.info().get("Swarm", {}).get("RemoteManagers", [])
+        advertise_addr = managers[0].get("Addr") if managers else None
+        _persist_swarm_state(tokens, advertise_addr)
+        return jsonify({"tokens": tokens, "advertise_addr": advertise_addr})
     except Exception as exc:  # noqa: BLE001
         return jsonify({"error": str(exc)}), 500
 
