@@ -21,10 +21,15 @@ process repeatable on fresh or recycled Pis.
 - (Optional) DNS or mDNS so you can visit `http://pi-manager:8080`
 
 ## Quickstart
-Each step is a one-liner. Run them in order.
+Each step is a single command. Follow them in order and run the commands exactly
+as shown on the indicated nodes.
+
+### Prep (all nodes)
+- Clone this repo onto **every** Pi (or copy `scripts/` and `stack/`).
+- Ensure `sudo` works without a password prompt if you plan to run unattended.
 
 ### 1) Install Docker (all nodes)
-Copy this repo to each Pi or download the scripts, then run:
+Run on every Pi (manager + workers):
 
 ```bash
 sudo bash scripts/install-docker.sh
@@ -34,21 +39,21 @@ Reboot once so the added cgroup flags in `/boot/cmdline.txt` take effect. The
 script is safe to rerun whenever you add or rebuild a node.
 
 ### 2) Initialize the swarm (manager)
-On `pi-manager` (swap in your preferred advertise IP if needed; the examples
-below use `192.168.88.7`):
+Run **only on `pi-manager`**. Swap in your advertise IP if different (example
+below uses `192.168.88.7`):
 
 ```bash
 sudo bash scripts/init-swarm.sh 192.168.88.7
 ```
 
-You’ll see **manager** and **worker** join tokens plus the advertise address
-used. The script also builds and auto-deploys the web control module on the
-manager so the dashboard is ready at `http://<manager-ip>:8081` as soon as the
-swarm comes online. If the node already belongs to a swarm, the script exits
-with the current membership details instead of reinitializing.
+The command prints fresh **manager** and **worker** join tokens plus the
+advertise address. It also builds and deploys the web control module so the
+dashboard is ready at `http://<manager-ip>:8081` immediately. If the node
+already belongs to a swarm, the script exits with the current membership details
+instead of reinitializing.
 
 ### 3) Join the workers
-On `pi-worker1` and `pi-worker2`, supply the worker token and manager IP:
+Run on `pi-worker1` and `pi-worker2` using the worker token from step 2:
 
 ```bash
 sudo bash scripts/join-swarm.sh 192.168.88.7 SWMTKN-1-...
@@ -62,7 +67,7 @@ docker node ls
 ```
 
 ### 4) Deploy the demo stack (manager)
-Ship the overlay network and demo services with:
+Run on the manager to create the overlay network and demo services:
 
 ```bash
 sudo bash scripts/deploy-demo.sh
@@ -86,7 +91,7 @@ control-plane tasks. When you deploy your own services, add a placement
 constraint such as `node.role == worker` to keep them off the manager, or adjust
 the replica count if you add more nodes to the cluster.
 
-### 5) Verify cross-node traffic
+### 5) Verify cross-node traffic (manager or any node)
 - Hit the published service: `curl http://192.168.88.7:8080` (or
   `http://pi-manager.local:8080`). The `Hostname` should vary between nodes.
 - Open the dashboard at `http://192.168.88.7:8081` for live metrics and overlay
