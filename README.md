@@ -154,6 +154,98 @@ Real-ESRGAN nodes.
    pre-existing `cluster_net` overlay so Redis and the workers can reach each
    other without extra configuration.
 
+## Exporting and syncing rendered textures
+Use `scripts/export-and-sync.sh` to watch the shared output volume and push new
+textures to a dedicated Git repository (for example, an `HDtextureDDS` repo).
+
+- **What it does:**
+  - Watches `WATCH_DIR` (default: `/srv/textures/output`) for new or updated
+    files and stages only texture artifacts that match `FILE_PATTERNS`
+    (default: `*.dds *.png`).
+  - Syncs staged files into `EXPORT_DIR` (default: `/srv/textures/export`) using
+    `rsync`, commits them, and pushes to `GIT_REMOTE_URL` on `GIT_BRANCH`.
+  - Supports SSH deploy keys via `GIT_SSH_KEY_PATH` or HTTPS tokens embedded in
+    `GIT_REMOTE_URL` (e.g., `https://<token>@github.com/org/HDtextureDDS.git`).
+  - Logs to stdout and, if `LOG_FILE` is set, appends to the specified file for
+    operators to monitor.
+
+- **Configuration:** create a `.env` file next to the script (or set env vars in
+  the service unit) to avoid hardcoding secrets:
+
+  ```env
+  WATCH_DIR=/srv/textures/output
+  EXPORT_DIR=/srv/textures/export
+  FILE_PATTERNS="*.dds *.png"
+  GIT_REMOTE_URL=git@github.com:org/HDtextureDDS.git
+  GIT_BRANCH=main
+  GIT_SSH_KEY_PATH=/home/pi/.ssh/deploy_key
+  GIT_USER_NAME=Texture Sync Bot
+  GIT_USER_EMAIL=bot@example.com
+  LOG_FILE=/var/log/texture-export.log
+  ```
+
+- **Running manually:**
+
+  ```bash
+  bash scripts/export-and-sync.sh
+  ```
+
+- **Scheduling options:**
+  - **systemd service + timer (recommended):**
+
+    ```ini
+    # /etc/systemd/system/texture-sync.service
+    [Unit]
+    Description=Texture export and Git sync
+    After=network-online.target
+
+    [Service]
+    EnvironmentFile=/srv/textures/.env
+    ExecStart=/usr/bin/bash /srv/SWG-RPI-Cluster/scripts/export-and-sync.sh
+    Restart=always
+    RestartSec=5s
+
+    # /etc/systemd/system/texture-sync.timer
+    [Unit]
+    Description=Start texture sync watcher
+
+    [Timer]
+    OnBootSec=15s
+    Unit=texture-sync.service
+
+    [Install]
+    WantedBy=timers.target
+    ```
+
+  - **Cron:** run a periodic sync if `inotifywait` isn’t available:
+
+    ```cron
+    */5 * * * * /usr/bin/env bash /srv/SWG-RPI-Cluster/scripts/export-and-sync.sh >> /var/log/texture-export.log 2>&1
+    ```
+
+  - **Swarm service:** deploy as a sidecar that mounts the shared volume and
+    your SSH key/`.env` secret:
+
+    ```bash
+    docker service create \
+      --name texture-sync \
+      --mount type=bind,src=/srv/textures,dst=/srv/textures \
+      --secret source=texture-env,target=/srv/textures/.env,mode=0400 \
+      --mount type=bind,src=/home/pi/.ssh/id_ed25519,dst=/id_ed25519,ro \
+      --env GIT_SSH_KEY_PATH=/id_ed25519 \
+      --env ENV_FILE=/srv/textures/.env \
+      --restart-condition=any \
+      bash:5.2 bash -lc '/workspace/SWG-RPI-Cluster/scripts/export-and-sync.sh'
+    ```
+
+- **Failure handling and logging:**
+  - Script exits on errors and writes tagged log lines; configure `LOG_FILE` and
+    `systemd` journal forwarding to alerting if needed.
+  - Pushes are skipped (but not fatal) when `GIT_REMOTE_URL` is unset so local
+    staging can proceed.
+  - `Restart=always` in systemd or `--restart-condition=any` in swarm keeps the
+    watcher alive after transient failures.
+
 ## Deploying the swarm dashboard by itself
 The Flask-based UI can be deployed without the demo services if you only need a
 live swarm view. See [dashboard/README.md](dashboard/README.md) for a
