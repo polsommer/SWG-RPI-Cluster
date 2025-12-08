@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import datetime as dt
+import json
 import os
 import shutil
 import socket
@@ -18,10 +19,38 @@ from subprocess import CalledProcessError, CompletedProcess, run
 app = Flask(__name__, static_folder="static", static_url_path="")
 client = docker.from_env()
 REPO_ROOT = Path(__file__).resolve().parents[1]
+METRICS_STORE = Path(os.environ.get("METRICS_STORE", "/tmp/service_metrics.json"))
+METRICS_LOCK = threading.Lock()
 
 
 def _bool_env(name: str, default: bool = False) -> bool:
     return os.environ.get(name, str(default)).strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _load_metrics_store() -> Dict[str, Any]:
+    if not METRICS_STORE.exists():
+        return {"services": {}, "last_updated": None}
+    try:
+        with METRICS_STORE.open() as fh:
+            return {"services": {}, "last_updated": None} | (json.load(fh) or {})
+    except Exception:  # noqa: BLE001
+        return {"services": {}, "last_updated": None}
+
+
+def _persist_metrics_store(store: Dict[str, Any]) -> None:
+    METRICS_STORE.parent.mkdir(parents=True, exist_ok=True)
+    with METRICS_LOCK:
+        with METRICS_STORE.open("w") as fh:
+            json.dump(store, fh, indent=2)
+
+
+def exponential_smoothing(values: List[float], alpha: float, default: float | None = None) -> float | None:
+    if not values:
+        return default
+    smoothed = values[0]
+    for value in values[1:]:
+        smoothed = alpha * value + (1 - alpha) * smoothed
+    return smoothed
 
 
 # Auto-remediation configuration
@@ -32,10 +61,19 @@ AUTO_REMEDIATE_COOLDOWN_SECONDS = int(os.environ.get("AUTO_REMEDIATE_COOLDOWN_SE
 AUTO_REMEDIATE_MIN_MANAGERS = int(os.environ.get("AUTO_REMEDIATE_MIN_MANAGERS", "1"))
 AUTO_REMEDIATE_EVENT_BUFFER = int(os.environ.get("AUTO_REMEDIATE_EVENT_BUFFER", "200"))
 
+AUTO_SCALE_ENABLED = _bool_env("AUTO_SCALE_ENABLED", True)
+AUTO_SCALE_INTERVAL = int(os.environ.get("AUTO_SCALE_INTERVAL", "30"))
+AUTO_SCALE_SMOOTHING = float(os.environ.get("AUTO_SCALE_SMOOTHING", "0.35"))
+AUTO_SCALE_MIN_REPLICAS = int(os.environ.get("AUTO_SCALE_MIN_REPLICAS", "1"))
+AUTO_SCALE_HISTORY_LIMIT = int(os.environ.get("AUTO_SCALE_HISTORY_LIMIT", "200"))
+AUTO_SCALE_FAILURE_WEIGHT = float(os.environ.get("AUTO_SCALE_FAILURE_WEIGHT", "1.5"))
+
 REMEDIATION_EVENTS: deque[Dict[str, Any]] = deque(maxlen=AUTO_REMEDIATE_EVENT_BUFFER)
 SERVICE_ATTEMPTS: Dict[str, Dict[str, Any]] = {}
 remediation_lock = threading.Lock()
 remediation_thread_started = False
+scaler_thread_started = False
+scale_events: deque[Dict[str, Any]] = deque(maxlen=100)
 
 
 def format_duration(seconds: float) -> str:
@@ -145,7 +183,9 @@ def summarize_services() -> List[Dict[str, Any]]:
         if "Replicated" in mode:
             replicas = mode["Replicated"].get("Replicas")
             desired = replicas
+        start = time.perf_counter()
         tasks = svc.tasks()
+        task_query_ms = (time.perf_counter() - start) * 1000
         running = len([t for t in tasks if t.get("Status", {}).get("State") == "running"])
         desired = desired or len(tasks)
 
@@ -164,6 +204,7 @@ def summarize_services() -> List[Dict[str, Any]]:
                 "replicas": replicas,
                 "task_states": task_states,
                 "labels": template.get("Labels", {}),
+                "task_query_ms": task_query_ms,
             }
         )
     return services
@@ -384,6 +425,160 @@ def host_metrics() -> Dict[str, Any]:
     }
 
 
+def record_service_metrics(services: List[Dict[str, Any]], host: Dict[str, Any]) -> Dict[str, Any]:
+    store = _load_metrics_store()
+    services_bucket = store.setdefault("services", {})
+    now = dt.datetime.utcnow().isoformat() + "Z"
+
+    for svc in services:
+        service_id = svc.get("id")
+        if not service_id:
+            continue
+
+        bucket = services_bucket.setdefault(
+            service_id, {"history": [], "name": svc.get("name"), "auto_scale": False}
+        )
+        bucket["name"] = svc.get("name")
+        bucket.setdefault("history", [])
+
+        task_states = svc.get("task_states", {}) or {}
+        failures = int(task_states.get("failed", 0)) + int(task_states.get("shutdown", 0))
+
+        bucket["history"].append(
+            {
+                "ts": now,
+                "running": svc.get("running"),
+                "desired": svc.get("desired"),
+                "replicas": svc.get("replicas"),
+                "failures": failures,
+                "response_ms": svc.get("task_query_ms"),
+                "host_cpu": host.get("cpu_percent"),
+                "host_mem": host.get("mem_percent"),
+            }
+        )
+
+        if len(bucket["history"]) > AUTO_SCALE_HISTORY_LIMIT:
+            bucket["history"] = bucket["history"][-AUTO_SCALE_HISTORY_LIMIT:]
+
+    store["last_updated"] = now
+    _persist_metrics_store(store)
+    return store
+
+
+def forecast_replicas(service_id: str, service_data: Dict[str, Any], current_replicas: int | None) -> Dict[str, Any]:
+    history = service_data.get("history", [])[-20:]
+    cpu_series = [float(h.get("host_cpu")) for h in history if h.get("host_cpu") is not None]
+    mem_series = [float(h.get("host_mem")) for h in history if h.get("host_mem") is not None]
+    failure_series = [float(h.get("failures", 0)) for h in history]
+    response_series = [float(h.get("response_ms")) for h in history if h.get("response_ms")]
+
+    predicted_cpu = exponential_smoothing(cpu_series, AUTO_SCALE_SMOOTHING, 0.0) or 0.0
+    predicted_mem = exponential_smoothing(mem_series, AUTO_SCALE_SMOOTHING, 0.0) or 0.0
+    predicted_failures = exponential_smoothing(failure_series, AUTO_SCALE_SMOOTHING, 0.0) or 0.0
+    predicted_response = exponential_smoothing(response_series, AUTO_SCALE_SMOOTHING, 0.0)
+
+    predicted_load = max(predicted_cpu, predicted_mem)
+    replicas = max(current_replicas or AUTO_SCALE_MIN_REPLICAS, AUTO_SCALE_MIN_REPLICAS)
+
+    if predicted_load > 75:
+        replicas += 1
+    elif predicted_load < 25 and replicas > AUTO_SCALE_MIN_REPLICAS:
+        replicas -= 1
+
+    if predicted_failures * AUTO_SCALE_FAILURE_WEIGHT >= 1:
+        replicas = max(replicas, (current_replicas or AUTO_SCALE_MIN_REPLICAS) + 1)
+
+    details = {
+        "service_id": service_id,
+        "predicted_cpu": predicted_cpu,
+        "predicted_mem": predicted_mem,
+        "predicted_failures": predicted_failures,
+        "predicted_response_ms": predicted_response,
+        "recommended_replicas": int(replicas),
+    }
+    return details
+
+
+def build_forecast_snapshot(services: List[Dict[str, Any]]) -> Dict[str, Any]:
+    store = _load_metrics_store()
+    services_bucket = store.get("services", {})
+    forecasts: List[Dict[str, Any]] = []
+
+    for svc in services:
+        service_id = svc.get("id")
+        if not service_id:
+            continue
+
+        bucket = services_bucket.get(service_id, {"history": [], "auto_scale": False})
+        recommendation = forecast_replicas(service_id, bucket, svc.get("replicas") or svc.get("desired"))
+        forecasts.append(
+            {
+                **recommendation,
+                "service_name": svc.get("name"),
+                "auto_scale": bucket.get("auto_scale", False),
+                "current_replicas": svc.get("replicas") or svc.get("desired"),
+                "recent": bucket.get("history", [])[-5:],
+            }
+        )
+
+    return {"services": forecasts, "recorded_at": store.get("last_updated")}
+
+
+def record_scale_event(service_name: str, desired: int | None, status: str, message: str) -> None:
+    event = {
+        "ts": dt.datetime.utcnow().isoformat() + "Z",
+        "service": service_name,
+        "replicas": desired,
+        "status": status,
+        "message": message,
+    }
+    scale_events.appendleft(event)
+    app.logger.info("[autoscaler] %s -> %s (%s)", service_name, desired, message)
+
+
+def update_service_replicas(service_id: str, replicas: int) -> None:
+    service = client.services.get(service_id)
+    mode = service.attrs.get("Spec", {}).get("Mode", {})
+    if "Replicated" not in mode:
+        raise ValueError("Only replicated services can be auto-scaled")
+
+    service.update(mode={"Replicated": {"Replicas": replicas}}, fetch_current_spec=True)
+
+
+def scaler_loop() -> None:
+    while True:
+        if not AUTO_SCALE_ENABLED:
+            time.sleep(AUTO_SCALE_INTERVAL)
+            continue
+
+        try:
+            services = summarize_services()
+            host = host_metrics()
+            store = record_service_metrics(services, host)
+            for svc in services:
+                svc_id = svc.get("id")
+                if not svc_id:
+                    continue
+
+                bucket = store.get("services", {}).get(svc_id, {})
+                if not bucket.get("auto_scale"):
+                    continue
+
+                recommendation = forecast_replicas(svc_id, bucket, svc.get("replicas") or svc.get("desired"))
+                target = max(int(recommendation.get("recommended_replicas", 0)), AUTO_SCALE_MIN_REPLICAS)
+                current = svc.get("replicas") or svc.get("desired") or 0
+                if target != current:
+                    try:
+                        update_service_replicas(svc_id, target)
+                        record_scale_event(svc.get("name", svc_id), target, "applied", "Adjusted replicas from forecast")
+                    except Exception as exc:  # noqa: BLE001
+                        record_scale_event(svc.get("name", svc_id), target, "error", str(exc))
+        except Exception as exc:  # noqa: BLE001
+            record_scale_event("controller", None, "error", str(exc))
+
+        time.sleep(AUTO_SCALE_INTERVAL)
+
+
 def git_command(args: List[str]) -> CompletedProcess[str]:
     return run(args, cwd=REPO_ROOT, capture_output=True, text=True, check=True)
 
@@ -537,6 +732,8 @@ def summary() -> Any:
     host = host_metrics()
     metrics = cluster_metrics(swarm, nodes, services)
     insights = build_insights(host, nodes, services)
+    metrics_store = record_service_metrics(services, host)
+    forecasts = build_forecast_snapshot(services)
     data = {
         "cluster": {
             "node_id": swarm.get("NodeID"),
@@ -552,9 +749,16 @@ def summary() -> Any:
         "services": services,
         "insights": insights,
         "redis_ping": worker_echo_rates(),
+        "forecasts": forecasts,
         "remediation": {
             "config": remediation_config(),
             "events": list(REMEDIATION_EVENTS)[:20],
+        },
+        "autoscaler": {
+            "enabled": AUTO_SCALE_ENABLED,
+            "interval_seconds": AUTO_SCALE_INTERVAL,
+            "last_metrics": metrics_store.get("last_updated"),
+            "events": list(scale_events),
         },
         "timestamp": dt.datetime.utcnow().isoformat() + "Z",
     }
@@ -567,15 +771,18 @@ def admin() -> Any:
     join_tokens = swarm.get("JoinTokens", {})
     managers = client.info().get("Swarm", {}).get("RemoteManagers", [])
     advertise_addr = managers[0].get("Addr") if managers else None
+    services = summarize_services()
 
     return jsonify(
         {
             "tokens": join_tokens,
             "advertise_addr": advertise_addr,
             "nodes": collect_nodes(),
-            "services": summarize_services(),
+            "services": services,
             "cluster": swarm,
             "repo": repo_update_status(False),
+            "forecasts": build_forecast_snapshot(services),
+            "autoscaler_events": list(scale_events),
         }
     )
 
@@ -667,6 +874,20 @@ def scale_service(service_id: str) -> Any:
         return jsonify({"error": str(exc)}), 500
 
 
+@app.post("/api/services/<service_id>/autoscale")
+def set_service_autoscale(service_id: str) -> Any:
+    payload = request.get_json(silent=True) or {}
+    enabled = bool(payload.get("enabled", False))
+
+    store = _load_metrics_store()
+    services_bucket = store.setdefault("services", {})
+    bucket = services_bucket.setdefault(service_id, {"history": [], "auto_scale": False})
+    bucket["auto_scale"] = enabled
+    _persist_metrics_store(store)
+
+    return jsonify({"service": service_id, "auto_scale": enabled})
+
+
 @app.get("/api/admin/repo-status")
 def repo_status() -> Any:
     return jsonify(repo_update_status(False))
@@ -713,7 +934,17 @@ def ensure_remediation_thread() -> None:
     remediation_thread_started = True
 
 
+def ensure_scaler_thread() -> None:
+    global scaler_thread_started
+    if scaler_thread_started:
+        return
+    scaler_thread = threading.Thread(target=scaler_loop, daemon=True)
+    scaler_thread.start()
+    scaler_thread_started = True
+
+
 ensure_remediation_thread()
+ensure_scaler_thread()
 
 
 if __name__ == "__main__":
