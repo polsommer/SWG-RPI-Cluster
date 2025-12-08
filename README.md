@@ -146,6 +146,10 @@ Real-ESRGAN nodes.
    - **esrgan-upscaler-gpu** – Real-ESRGAN workers pinned to GPU-labeled
      workers (replicated across nodes with `max_replicas_per_node: 1`).
    - **esrgan-upscaler-cpu** – CPU fallback upscalers for non-GPU workers.
+     Listens on `INPUT_CHANNEL` for `scan` events, pulls textures from
+     `/srv/textures/incoming`, writes CPU-safe upscales into
+     `/srv/textures/output`, and emits status/results on `OUTPUT_CHANNEL`
+     (JSON events for online status, completed scans, successes, and errors).
    - **metadata-analyzer** – LLM-driven metadata annotator that reads
      upscales and emits summaries on its own Redis channel.
 

@@ -86,25 +86,145 @@ services:
       - /bin/sh
       - -c
       - |
-        pip install --no-cache-dir realesrgan redis pillow && \
+        pip install --no-cache-dir redis pillow && \
         python - <<'PY'
+        import json
         import os
         import time
+        from pathlib import Path
+
         from redis import Redis
-        redis = Redis.from_url(os.environ.get("REDIS_URL", "redis://redis-bus:6379/0"))
-        input_channel = os.environ.get("INPUT_CHANNEL", "texture:ingest")
-        output_channel = os.environ.get("OUTPUT_CHANNEL", "texture:upscaled")
-        path = os.environ.get("TEXTURE_PATH", "/srv/textures")
-        redis.publish(output_channel, f"cpu-upscaler-online using {path}")
+        from PIL import Image
+
+
+        def get_env(key: str, default: str) -> str:
+            return os.environ.get(key, default)
+
+
+        redis = Redis.from_url(get_env("REDIS_URL", "redis://redis-bus:6379/0"), decode_responses=True)
+        input_channel = get_env("INPUT_CHANNEL", "texture:ingest")
+        output_channel = get_env("OUTPUT_CHANNEL", "texture:upscaled")
+        base_path = Path(get_env("TEXTURE_PATH", "/srv/textures"))
+        input_path = base_path / get_env("INPUT_PATH", "incoming")
+        output_path = base_path / get_env("OUTPUT_PATH", "output")
+        scale_factor = float(get_env("UPSCALE_FACTOR", "2"))
+        max_retries = int(get_env("UPSCALE_RETRIES", "3"))
+        supported_extensions = {".png", ".jpg", ".jpeg", ".bmp", ".tga", ".tif", ".tiff"}
+
+        input_path.mkdir(parents=True, exist_ok=True)
+        output_path.mkdir(parents=True, exist_ok=True)
+
+
+        def publish(event: str, **payload):
+            message = {"event": event, **payload}
+            redis.publish(output_channel, json.dumps(message))
+
+
+        def upscale_image(source: Path, destination: Path) -> bool:
+            for attempt in range(1, max_retries + 1):
+                try:
+                    with Image.open(source) as img:
+                        new_size = (int(img.width * scale_factor), int(img.height * scale_factor))
+                        upscaled = img.resize(new_size, Image.LANCZOS)
+                        destination.parent.mkdir(parents=True, exist_ok=True)
+                        upscaled.save(destination)
+                    publish(
+                        "upscaled",
+                        input=str(source),
+                        output=str(destination),
+                        scale=scale_factor,
+                    )
+                    return True
+                except Exception as exc:  # noqa: BLE001
+                    publish(
+                        "error",
+                        input=str(source),
+                        attempt=attempt,
+                        error=str(exc),
+                    )
+                    time.sleep(min(10, attempt * 2))
+            return False
+
+
+        def candidate_files(target: Path):
+            if target.is_file():
+                yield target
+                return
+            if not target.exists():
+                publish("warning", message=f"Path not found: {target}")
+                return
+            for root, _, files in os.walk(target):
+                for name in files:
+                    path = Path(root) / name
+                    if path.suffix.lower() in supported_extensions:
+                        yield path
+
+
+        def output_for(source: Path) -> Path:
+            try:
+                relative = source.relative_to(input_path)
+            except ValueError:
+                relative = source.name
+            return output_path / relative
+
+
+        def process_scan(scan_target: str):
+            target = Path(scan_target) if scan_target else input_path
+            processed = 0
+            for candidate in candidate_files(target):
+                destination = output_for(candidate)
+                if destination.exists():
+                    continue
+                success = upscale_image(candidate, destination)
+                processed += 1 if success else 0
+            publish("scan-complete", target=str(target), processed=processed)
+
+
+        def listen_and_process():
+            publish(
+                "cpu-upscaler-online",
+                input_channel=input_channel,
+                output_channel=output_channel,
+                input_path=str(input_path),
+                output_path=str(output_path),
+            )
+            pubsub = redis.pubsub(ignore_subscribe_messages=True)
+            pubsub.subscribe(input_channel)
+            for message in pubsub.listen():
+                try:
+                    payload = message.get("data")
+                    if not payload:
+                        continue
+                    if isinstance(payload, bytes):
+                        payload = payload.decode()
+                    text = str(payload).strip()
+                    if text.startswith("scan"):
+                        parts = text.split(maxsplit=1)
+                        target = parts[1] if len(parts) > 1 else str(input_path)
+                        process_scan(target)
+                    else:
+                        process_scan(text)
+                except Exception as exc:  # noqa: BLE001
+                    publish("listener-error", error=str(exc))
+                    time.sleep(5)
+
+
         while True:
-            redis.publish(output_channel, "cpu-upscaler-heartbeat")
-            time.sleep(30)
+            try:
+                listen_and_process()
+            except Exception as exc:  # noqa: BLE001
+                publish("fatal-error", error=str(exc))
+                time.sleep(5)
         PY
     environment:
       - REDIS_URL=redis://redis-bus:6379/0
       - INPUT_CHANNEL=texture:ingest
       - OUTPUT_CHANNEL=texture:upscaled
       - TEXTURE_PATH=/srv/textures
+      - INPUT_PATH=incoming
+      - OUTPUT_PATH=output
+      - UPSCALE_FACTOR=2
+      - UPSCALE_RETRIES=3
     volumes:
       - textures-share:/srv/textures
     networks:
