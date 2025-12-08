@@ -117,6 +117,10 @@ AUTO_SCALE_MIN_REPLICAS = int(os.environ.get("AUTO_SCALE_MIN_REPLICAS", "1"))
 AUTO_SCALE_HISTORY_LIMIT = int(os.environ.get("AUTO_SCALE_HISTORY_LIMIT", "200"))
 AUTO_SCALE_FAILURE_WEIGHT = float(os.environ.get("AUTO_SCALE_FAILURE_WEIGHT", "1.5"))
 
+TEXTURE_LLM_NAME = os.environ.get("TEXTURE_LLM_NAME", "Texture LLM")
+TEXTURE_LLM_ENDPOINT = os.environ.get("TEXTURE_LLM_ENDPOINT")
+TEXTURE_LLM_ENABLED = _bool_env("TEXTURE_LLM_ENABLED", True)
+
 REMEDIATION_EVENTS: deque[Dict[str, Any]] = deque(maxlen=AUTO_REMEDIATE_EVENT_BUFFER)
 SERVICE_ATTEMPTS: Dict[str, Dict[str, Any]] = {}
 remediation_lock = threading.Lock()
@@ -198,6 +202,19 @@ def remediation_config() -> Dict[str, Any]:
         "max_service_restarts": AUTO_REMEDIATE_MAX_RESTARTS,
         "cooldown_seconds": AUTO_REMEDIATE_COOLDOWN_SECONDS,
         "min_managers": AUTO_REMEDIATE_MIN_MANAGERS,
+    }
+
+
+def texture_llm_status() -> Dict[str, Any]:
+    status = "online" if TEXTURE_LLM_ENABLED else "standby"
+    headline = "Active remediation and insights" if TEXTURE_LLM_ENABLED else "Ready on demand"
+    return {
+        "name": TEXTURE_LLM_NAME,
+        "enabled": TEXTURE_LLM_ENABLED,
+        "status": status,
+        "headline": headline,
+        "endpoint": TEXTURE_LLM_ENDPOINT,
+        "message": "Intelligent cluster guidance powered by Texture." if TEXTURE_LLM_ENABLED else "Enable Texture to enrich decisions.",
     }
 
 
@@ -850,6 +867,7 @@ def summary() -> Any:
         "services": services,
         "insights": insights,
         "redis_ping": worker_echo_rates(),
+        "llm": texture_llm_status(),
         "forecasts": forecasts,
         "remediation": {
             "config": remediation_config(),
@@ -884,6 +902,7 @@ def admin() -> Any:
             "repo": repo_update_status(False),
             "forecasts": build_forecast_snapshot(services),
             "autoscaler_events": list(scale_events),
+            "llm": texture_llm_status(),
         }
     )
 
@@ -947,6 +966,24 @@ def set_node_labels(node_id: str) -> Any:
         spec["Labels"] = current_labels
         node.update(spec)
         return jsonify({"ok": True, "node_id": node_id, "labels": current_labels})
+    except Exception as exc:  # noqa: BLE001
+        return jsonify({"error": str(exc)}), 500
+
+
+@app.post("/api/nodes/<node_id>/remove")
+def remove_node(node_id: str) -> Any:
+    payload = request.get_json(silent=True) or {}
+    force = bool(payload.get("force"))
+
+    try:
+        node = client.nodes.get(node_id)
+        spec = dict(node.attrs.get("Spec", {}))
+        if not force and spec.get("Availability") != "drain":
+            spec["Availability"] = "drain"
+            node.update(spec)
+
+        client.api.remove_node(node_id, force=force)
+        return jsonify({"ok": True, "node_id": node_id, "force": force})
     except Exception as exc:  # noqa: BLE001
         return jsonify({"error": str(exc)}), 500
 
