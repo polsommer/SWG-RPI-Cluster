@@ -4,7 +4,9 @@ import datetime as dt
 import os
 import shutil
 import socket
+import threading
 import time
+from collections import deque
 from pathlib import Path
 from typing import Any, Dict, List, Tuple
 
@@ -16,6 +18,24 @@ from subprocess import CalledProcessError, CompletedProcess, run
 app = Flask(__name__, static_folder="static", static_url_path="")
 client = docker.from_env()
 REPO_ROOT = Path(__file__).resolve().parents[1]
+
+
+def _bool_env(name: str, default: bool = False) -> bool:
+    return os.environ.get(name, str(default)).strip().lower() in {"1", "true", "yes", "on"}
+
+
+# Auto-remediation configuration
+AUTO_REMEDIATE_ENABLED = _bool_env("AUTO_REMEDIATE_ENABLED", False)
+AUTO_REMEDIATE_INTERVAL = int(os.environ.get("AUTO_REMEDIATE_INTERVAL", "30"))
+AUTO_REMEDIATE_MAX_RESTARTS = int(os.environ.get("AUTO_REMEDIATE_MAX_RESTARTS", "3"))
+AUTO_REMEDIATE_COOLDOWN_SECONDS = int(os.environ.get("AUTO_REMEDIATE_COOLDOWN_SECONDS", "180"))
+AUTO_REMEDIATE_MIN_MANAGERS = int(os.environ.get("AUTO_REMEDIATE_MIN_MANAGERS", "1"))
+AUTO_REMEDIATE_EVENT_BUFFER = int(os.environ.get("AUTO_REMEDIATE_EVENT_BUFFER", "200"))
+
+REMEDIATION_EVENTS: deque[Dict[str, Any]] = deque(maxlen=AUTO_REMEDIATE_EVENT_BUFFER)
+SERVICE_ATTEMPTS: Dict[str, Dict[str, Any]] = {}
+remediation_lock = threading.Lock()
+remediation_thread_started = False
 
 
 def format_duration(seconds: float) -> str:
@@ -83,6 +103,29 @@ def summarize_node_health(nodes: List[Dict[str, Any]]) -> Dict[str, Any]:
     return summary
 
 
+def remediation_config() -> Dict[str, Any]:
+    return {
+        "enabled": AUTO_REMEDIATE_ENABLED,
+        "interval_seconds": AUTO_REMEDIATE_INTERVAL,
+        "max_service_restarts": AUTO_REMEDIATE_MAX_RESTARTS,
+        "cooldown_seconds": AUTO_REMEDIATE_COOLDOWN_SECONDS,
+        "min_managers": AUTO_REMEDIATE_MIN_MANAGERS,
+    }
+
+
+def record_remediation_event(action: str, target: str, status: str, message: str) -> None:
+    event = {
+        "ts": dt.datetime.utcnow().isoformat() + "Z",
+        "action": action,
+        "target": target,
+        "status": status,
+        "message": message,
+    }
+    with remediation_lock:
+        REMEDIATION_EVENTS.appendleft(event)
+    app.logger.info("[auto-remediation] %s %s - %s", action, target, message)
+
+
 def summarize_service_tasks(tasks: List[Dict[str, Any]]) -> Dict[str, int]:
     summary: Dict[str, int] = {}
     for task in tasks:
@@ -142,6 +185,134 @@ def evaluate_service_health(services: List[Dict[str, Any]]) -> Dict[str, Any]:
         "unstable": unstable,
         "healthy": len(services) - len(unhealthy_ids),
     }
+
+
+def _within_limits(service_id: str) -> bool:
+    now = time.time()
+    meta = SERVICE_ATTEMPTS.get(service_id, {"count": 0, "last": 0.0})
+    if now - meta.get("last", 0) > AUTO_REMEDIATE_COOLDOWN_SECONDS:
+        meta = {"count": 0, "last": 0.0}
+    if meta["count"] >= AUTO_REMEDIATE_MAX_RESTARTS:
+        return False
+    SERVICE_ATTEMPTS[service_id] = meta
+    return True
+
+
+def _register_attempt(service_id: str) -> None:
+    meta = SERVICE_ATTEMPTS.get(service_id, {"count": 0, "last": 0.0})
+    meta["count"] += 1
+    meta["last"] = time.time()
+    SERVICE_ATTEMPTS[service_id] = meta
+
+
+def remediate_services(services: List[Dict[str, Any]]) -> None:
+    health = evaluate_service_health(services)
+    unhealthy = {s.get("id"): s for s in health.get("under_replicated", []) + health.get("unstable", [])}
+
+    for service_id, service_data in unhealthy.items():
+        if not _within_limits(service_id):
+            record_remediation_event(
+                "service-skip",
+                service_data.get("name", service_id),
+                "skipped",
+                "Restart limit reached; waiting for cooldown",
+            )
+            continue
+
+        try:
+            service = client.services.get(service_id)
+            desired = service_data.get("desired") or service_data.get("replicas")
+            if service_data.get("mode") == "replicated" and desired and service_data.get("running") is not None:
+                service.scale(desired)
+            service.force_update()
+            _register_attempt(service_id)
+            record_remediation_event(
+                "service-redeploy",
+                service_data.get("name", service_id),
+                "success",
+                f"Force-updated after instability (running {service_data.get('running')} of {service_data.get('desired')}).",
+            )
+        except Exception as exc:  # noqa: BLE001
+            record_remediation_event(
+                "service-redeploy",
+                service_data.get("name", service_id),
+                "error",
+                str(exc),
+            )
+
+
+def _drain_unreachable_nodes(nodes: List[Dict[str, Any]]) -> None:
+    for node in nodes:
+        if node_health_state(node) == "unreachable" and node.get("availability") != "drain":
+            try:
+                swarm_node = client.nodes.get(node.get("id"))
+                spec = dict(swarm_node.attrs.get("Spec", {}))
+                spec["Availability"] = "drain"
+                swarm_node.update(spec)
+                record_remediation_event(
+                    "node-drain",
+                    node.get("hostname", node.get("id", "unknown")),
+                    "success",
+                    "Node unreachable; drained to protect scheduling.",
+                )
+            except Exception as exc:  # noqa: BLE001
+                record_remediation_event(
+                    "node-drain",
+                    node.get("hostname", node.get("id", "unknown")),
+                    "error",
+                    str(exc),
+                )
+
+
+def _promote_managers(nodes: List[Dict[str, Any]]) -> None:
+    healthy_managers = [n for n in nodes if n.get("role") == "manager" and node_health_state(n) == "healthy"]
+    if len(healthy_managers) >= AUTO_REMEDIATE_MIN_MANAGERS:
+        return
+
+    candidates = [
+        n
+        for n in nodes
+        if n.get("role") == "worker"
+        and node_health_state(n) == "healthy"
+        and n.get("availability") != "drain"
+    ]
+    if not candidates:
+        record_remediation_event(
+            "manager-promote",
+            "cluster",
+            "skipped",
+            "No healthy workers available for promotion.",
+        )
+        return
+
+    try:
+        target = candidates[0]
+        swarm_node = client.nodes.get(target.get("id"))
+        spec = dict(swarm_node.attrs.get("Spec", {}))
+        spec["Role"] = "manager"
+        swarm_node.update(spec)
+        record_remediation_event(
+            "manager-promote",
+            target.get("hostname", target.get("id", "unknown")),
+            "success",
+            "Promoted worker to maintain manager quorum.",
+        )
+    except Exception as exc:  # noqa: BLE001
+        record_remediation_event(
+            "manager-promote",
+            target.get("hostname", target.get("id", "unknown")),
+            "error",
+            str(exc),
+        )
+
+
+def run_remediation_cycle() -> None:
+    nodes = collect_nodes()
+    services = summarize_services()
+
+    _drain_unreachable_nodes(nodes)
+    _promote_managers(nodes)
+    remediate_services(services)
 
 
 def worker_echo_rates() -> Dict[str, Any]:
@@ -343,6 +514,20 @@ def build_insights(host: Dict[str, Any], nodes: List[Dict[str, Any]], services: 
     }
 
 
+def remediation_loop() -> None:
+    while True:
+        if not AUTO_REMEDIATE_ENABLED:
+            time.sleep(AUTO_REMEDIATE_INTERVAL)
+            continue
+
+        try:
+            run_remediation_cycle()
+        except Exception as exc:  # noqa: BLE001
+            record_remediation_event("controller-error", "controller", "error", str(exc))
+
+        time.sleep(AUTO_REMEDIATE_INTERVAL)
+
+
 @app.route("/api/summary")
 def summary() -> Any:
     info = client.info()
@@ -367,6 +552,10 @@ def summary() -> Any:
         "services": services,
         "insights": insights,
         "redis_ping": worker_echo_rates(),
+        "remediation": {
+            "config": remediation_config(),
+            "events": list(REMEDIATION_EVENTS)[:20],
+        },
         "timestamp": dt.datetime.utcnow().isoformat() + "Z",
     }
     return jsonify(data)
@@ -513,6 +702,18 @@ def root() -> Any:
 @app.route("/<path:filename>")
 def serve_static(filename: str) -> Any:
     return send_from_directory(app.static_folder, filename)
+
+
+def ensure_remediation_thread() -> None:
+    global remediation_thread_started
+    if remediation_thread_started:
+        return
+    remediation_thread = threading.Thread(target=remediation_loop, daemon=True)
+    remediation_thread.start()
+    remediation_thread_started = True
+
+
+ensure_remediation_thread()
 
 
 if __name__ == "__main__":
