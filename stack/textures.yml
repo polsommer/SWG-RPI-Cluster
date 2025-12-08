@@ -8,6 +8,10 @@ volumes:
   textures-share:
   redis-data:
 
+configs:
+  metadata-analyzer-script:
+    file: ./stack/metadata_analyzer.py
+
 services:
   redis-bus:
     image: redis:7-alpine
@@ -125,26 +129,23 @@ services:
       - /bin/sh
       - -c
       - |
-        pip install --no-cache-dir redis && \
-        python - <<'PY'
-        import os
-        import time
-        from redis import Redis
-        redis = Redis.from_url(os.environ.get("REDIS_URL", "redis://redis-bus:6379/0"))
-        input_channel = os.environ.get("INPUT_CHANNEL", "texture:upscaled")
-        output_channel = os.environ.get("OUTPUT_CHANNEL", "texture:metadata")
-        redis.publish(output_channel, "llm-metadata-analyzer-online")
-        while True:
-            redis.publish(output_channel, "llm-metadata-analyzer-heartbeat")
-            time.sleep(30)
-        PY
+        pip install --no-cache-dir redis requests pillow && \
+        python /opt/metadata_analyzer.py
     environment:
       - REDIS_URL=redis://redis-bus:6379/0
       - INPUT_CHANNEL=texture:upscaled
       - OUTPUT_CHANNEL=texture:metadata
       - SHARED_PATH=/srv/textures
+      - LLM_BACKEND=echo
+      - LLM_MODEL=gpt-4o-mini
+      - METADATA_SUFFIX=.metadata.json
+      - HEARTBEAT_SECONDS=30
     volumes:
       - textures-share:/srv/textures
+    configs:
+      - source: metadata-analyzer-script
+        target: /opt/metadata_analyzer.py
+        mode: 0444
     networks:
       - cluster_net
     depends_on:

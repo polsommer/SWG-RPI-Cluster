@@ -147,7 +147,15 @@ Real-ESRGAN nodes.
      workers (replicated across nodes with `max_replicas_per_node: 1`).
    - **esrgan-upscaler-cpu** – CPU fallback upscalers for non-GPU workers.
    - **metadata-analyzer** – LLM-driven metadata annotator that reads
-     upscales and emits summaries on its own Redis channel.
+     upscales, generates captions/tags through a configurable LLM backend, and
+     publishes structured metadata on its own Redis channel while writing
+     sidecar JSON next to each texture.
+
+   Configure the analyzer with `LLM_BACKEND` (for example `openai`, `local`, or
+   the default `echo` mode), `LLM_MODEL`, `LLM_ENDPOINT`, and `LLM_API_KEY` as
+   needed. Metadata is persisted alongside each texture with the suffix
+   `.metadata.json` and mirrored to the `texture:metadata` channel together with
+   latency metrics for observability.
 
    All services mount the shared `textures-share` volume at `/srv/textures` so
    inputs/outputs stay consistent across nodes. The stack reuses the
