@@ -113,6 +113,10 @@
       <h3>Redis Mesh Check</h3>
       <div id="redis-card" class="stacked muted"></div>
     </div>
+    <div class="card">
+      <h3>Texture LLM</h3>
+      <div id="llm-card" class="stacked muted"></div>
+    </div>
     <div class="card" style="grid-column: 1 / -1;">
       <h3>Smart Insights</h3>
       <div class="muted" style="margin-bottom: 8px;">Auto-curated health signals from host, nodes, and services.</div>
@@ -333,6 +337,8 @@
         <div><strong>Ping:</strong> ${r.ping_ms ? r.ping_ms.toFixed(1) + ' ms' : 'n/a'}</div>
       `;
 
+      renderLlm(data.llm);
+
       const nodes = data.nodes || [];
       nodesCache = nodes;
       populateSshNodes(nodes);
@@ -455,6 +461,25 @@
       `;
     }
 
+    function renderLlm(llm) {
+      const root = document.getElementById('llm-card');
+      if (!root) return;
+      if (!llm) {
+        root.innerHTML = '<div class="muted">LLM status unavailable.</div>';
+        return;
+      }
+      const status = llm.status || (llm.enabled ? 'online' : 'standby');
+      const endpoint = llm.endpoint ? `<div class="muted">Endpoint: ${llm.endpoint}</div>` : '';
+      root.innerHTML = `
+        <div class="toolbar" style="justify-content: space-between;">
+          <div><strong>${llm.name || 'Texture LLM'}</strong><div class="muted">${llm.headline || ''}</div></div>
+          <span class="pill ${llm.enabled ? 'good' : 'bad'}">${status}</span>
+        </div>
+        <div>${llm.message || 'Guiding remediation and forecasting.'}</div>
+        ${endpoint}
+      `;
+    }
+
     function copyCommand(id) {
       const el = document.getElementById(id);
       if (!el) return;
@@ -512,6 +537,26 @@
       } catch (err) {
         console.error(err);
         setStatus('Unable to change node role', false);
+      }
+    }
+
+    async function removeNode(nodeId, force = false) {
+      const confirmed = confirm(`Are you sure you want to ${force ? 'force ' : ''}remove node ${nodeId}?`);
+      if (!confirmed) return;
+      try {
+        const res = await authedFetch(`/api/nodes/${nodeId}/remove`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ force })
+        });
+        const payload = await res.json();
+        if (!res.ok || payload.error) throw new Error(payload.error || 'Failed to remove node');
+        await refresh();
+        await refreshAdmin();
+        setStatus(`Node ${nodeId} removed${force ? ' (force)' : ''}`, true);
+      } catch (err) {
+        console.error(err);
+        setStatus(err.message || 'Unable to remove node', false);
       }
     }
 
@@ -685,6 +730,14 @@
           </div>
         </div>
         <div class="control-row" style="flex-direction: column; align-items: stretch;">
+          <div class="toolbar" style="justify-content: space-between; flex-wrap: wrap;">
+            <div><strong>Texture LLM</strong><div class="muted">Intelligent insights and guidance.</div></div>
+            <span class="pill ${data.llm?.enabled ? 'good' : 'bad'}">${data.llm?.status || (data.llm?.enabled ? 'online' : 'standby')}</span>
+          </div>
+          <div class="muted">${data.llm?.message || 'LLM status unavailable.'}</div>
+          ${data.llm?.endpoint ? `<div class="muted">Endpoint: ${data.llm.endpoint}</div>` : ''}
+        </div>
+        <div class="control-row" style="flex-direction: column; align-items: stretch;">
           <div class="toolbar" style="justify-content: space-between;">
             <div><strong>Node availability</strong><div class="muted">Drain, reactivate, or fix manager roles and labels.</div></div>
           </div>
@@ -708,6 +761,8 @@
                     <button class="btn danger" onclick="setAvailability('${n.id}', 'drain')">Drain</button>
                     <button class="btn" onclick="setRole('${n.id}', 'manager')">Promote</button>
                     <button class="btn ghost" onclick="setRole('${n.id}', 'worker')">Demote</button>
+                    <button class="btn danger" onclick="removeNode('${n.id}', false)">Remove</button>
+                    <button class="btn ghost" onclick="removeNode('${n.id}', true)">Force remove</button>
                     ${sshCommand ? `<button class="btn ghost" onclick="copySsh('${sshCommand}')">Copy SSH</button>` : ''}
                   </div>
                   <div style="flex: 1; min-width: 220px;">
