@@ -118,6 +118,42 @@ docker stack rm swg-demo
 The overlay network `cluster_net` is created once and reused; remove it with
 `docker network rm cluster_net` if you want a full cleanup.
 
+## Deploying the texture processing stack (manager)
+Use `stack/textures.yml` to ship a Redis-backed texture pipeline that shares a
+single volume across ingestion, upscaling, and LLM metadata analysis workers.
+Placement constraints keep replicas on workers, with optional GPU labels for the
+Real-ESRGAN nodes.
+
+1. (Optional) Label GPU-capable nodes so the Real-ESRGAN workers land where
+   hardware acceleration is available:
+
+   ```bash
+   docker node update --label-add gpu=true <node-name>
+   ```
+
+2. Deploy the stack, reusing the existing `cluster_net` overlay network created
+   by the demo scripts:
+
+   ```bash
+   docker stack deploy -c stack/textures.yml swg-textures
+   ```
+
+   The compose file includes:
+   - **redis-bus** – shared message queue on the manager for simple channel
+     orchestration (`texture:ingest`, `texture:upscaled`, `texture:metadata`).
+   - **texture-ingestion** – publishes new work from `/srv/textures/incoming`
+     into Redis so the upscalers can pick it up.
+   - **esrgan-upscaler-gpu** – Real-ESRGAN workers pinned to GPU-labeled
+     workers (replicated across nodes with `max_replicas_per_node: 1`).
+   - **esrgan-upscaler-cpu** – CPU fallback upscalers for non-GPU workers.
+   - **metadata-analyzer** – LLM-driven metadata annotator that reads
+     upscales and emits summaries on its own Redis channel.
+
+   All services mount the shared `textures-share` volume at `/srv/textures` so
+   inputs/outputs stay consistent across nodes. The stack reuses the
+   pre-existing `cluster_net` overlay so Redis and the workers can reach each
+   other without extra configuration.
+
 ## Deploying the swarm dashboard by itself
 The Flask-based UI can be deployed without the demo services if you only need a
 live swarm view. See [dashboard/README.md](dashboard/README.md) for a
