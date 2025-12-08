@@ -156,6 +156,92 @@ AUTO_SCALE_MIN_REPLICAS = int(os.environ.get("AUTO_SCALE_MIN_REPLICAS", "1"))
 AUTO_SCALE_HISTORY_LIMIT = int(os.environ.get("AUTO_SCALE_HISTORY_LIMIT", "200"))
 AUTO_SCALE_FAILURE_WEIGHT = float(os.environ.get("AUTO_SCALE_FAILURE_WEIGHT", "1.5"))
 
+DEFAULT_CONTROLLER_CONFIG = {
+    "auto_remediate_enabled": AUTO_REMEDIATE_ENABLED,
+    "auto_remediate_interval": AUTO_REMEDIATE_INTERVAL,
+    "auto_remediate_max_restarts": AUTO_REMEDIATE_MAX_RESTARTS,
+    "auto_remediate_cooldown_seconds": AUTO_REMEDIATE_COOLDOWN_SECONDS,
+    "auto_remediate_min_managers": AUTO_REMEDIATE_MIN_MANAGERS,
+    "auto_remediate_event_buffer": AUTO_REMEDIATE_EVENT_BUFFER,
+    "auto_scale_enabled": AUTO_SCALE_ENABLED,
+    "auto_scale_interval": AUTO_SCALE_INTERVAL,
+    "auto_scale_smoothing": AUTO_SCALE_SMOOTHING,
+    "auto_scale_min_replicas": AUTO_SCALE_MIN_REPLICAS,
+    "auto_scale_history_limit": AUTO_SCALE_HISTORY_LIMIT,
+    "auto_scale_failure_weight": AUTO_SCALE_FAILURE_WEIGHT,
+}
+
+
+def _persist_controller_config(config: Dict[str, Any]) -> None:
+    state = _load_state_store()
+    state["controller_config"] = config
+    _persist_state_store(state)
+
+
+def _apply_controller_config(config: Dict[str, Any], persist: bool = True) -> Dict[str, Any]:
+    global AUTO_REMEDIATE_ENABLED
+    global AUTO_REMEDIATE_INTERVAL
+    global AUTO_REMEDIATE_MAX_RESTARTS
+    global AUTO_REMEDIATE_COOLDOWN_SECONDS
+    global AUTO_REMEDIATE_MIN_MANAGERS
+    global AUTO_REMEDIATE_EVENT_BUFFER
+    global AUTO_SCALE_ENABLED
+    global AUTO_SCALE_INTERVAL
+    global AUTO_SCALE_SMOOTHING
+    global AUTO_SCALE_MIN_REPLICAS
+    global AUTO_SCALE_HISTORY_LIMIT
+    global AUTO_SCALE_FAILURE_WEIGHT
+    global REMEDIATION_EVENTS
+
+    merged = {**DEFAULT_CONTROLLER_CONFIG, **config}
+
+    AUTO_REMEDIATE_ENABLED = bool(merged.get("auto_remediate_enabled"))
+    AUTO_REMEDIATE_INTERVAL = max(5, int(merged.get("auto_remediate_interval", 30)))
+    AUTO_REMEDIATE_MAX_RESTARTS = max(1, int(merged.get("auto_remediate_max_restarts", 3)))
+    AUTO_REMEDIATE_COOLDOWN_SECONDS = max(30, int(merged.get("auto_remediate_cooldown_seconds", 180)))
+    AUTO_REMEDIATE_MIN_MANAGERS = max(1, int(merged.get("auto_remediate_min_managers", 1)))
+    AUTO_REMEDIATE_EVENT_BUFFER = max(50, int(merged.get("auto_remediate_event_buffer", 200)))
+
+    AUTO_SCALE_ENABLED = bool(merged.get("auto_scale_enabled", True))
+    AUTO_SCALE_INTERVAL = max(5, int(merged.get("auto_scale_interval", 30)))
+    AUTO_SCALE_SMOOTHING = float(merged.get("auto_scale_smoothing", 0.35))
+    AUTO_SCALE_MIN_REPLICAS = max(1, int(merged.get("auto_scale_min_replicas", 1)))
+    AUTO_SCALE_HISTORY_LIMIT = max(20, int(merged.get("auto_scale_history_limit", 200)))
+    AUTO_SCALE_FAILURE_WEIGHT = float(merged.get("auto_scale_failure_weight", 1.5))
+
+    REMEDIATION_EVENTS = deque(list(REMEDIATION_EVENTS), maxlen=AUTO_REMEDIATE_EVENT_BUFFER)
+
+    current = controller_config()
+    if persist:
+        _persist_controller_config(current)
+    return current
+
+
+def _hydrate_controller_config() -> Dict[str, Any]:
+    store = _load_state_store()
+    stored = store.get("controller_config") if isinstance(store, dict) else None
+    if isinstance(stored, dict):
+        return _apply_controller_config(stored, persist=False)
+    return controller_config()
+
+
+def controller_config() -> Dict[str, Any]:
+    return {
+        "auto_remediate_enabled": AUTO_REMEDIATE_ENABLED,
+        "auto_remediate_interval": AUTO_REMEDIATE_INTERVAL,
+        "auto_remediate_max_restarts": AUTO_REMEDIATE_MAX_RESTARTS,
+        "auto_remediate_cooldown_seconds": AUTO_REMEDIATE_COOLDOWN_SECONDS,
+        "auto_remediate_min_managers": AUTO_REMEDIATE_MIN_MANAGERS,
+        "auto_remediate_event_buffer": AUTO_REMEDIATE_EVENT_BUFFER,
+        "auto_scale_enabled": AUTO_SCALE_ENABLED,
+        "auto_scale_interval": AUTO_SCALE_INTERVAL,
+        "auto_scale_smoothing": AUTO_SCALE_SMOOTHING,
+        "auto_scale_min_replicas": AUTO_SCALE_MIN_REPLICAS,
+        "auto_scale_history_limit": AUTO_SCALE_HISTORY_LIMIT,
+        "auto_scale_failure_weight": AUTO_SCALE_FAILURE_WEIGHT,
+    }
+
+
 TEXTURE_LLM_NAME = os.environ.get("TEXTURE_LLM_NAME", "Texture LLM")
 TEXTURE_LLM_ENDPOINT = os.environ.get("TEXTURE_LLM_ENDPOINT")
 TEXTURE_LLM_ENABLED = _bool_env("TEXTURE_LLM_ENABLED", True)
@@ -182,6 +268,8 @@ onboarding_state: Dict[str, Any] = {
     "validation": None,
     "tokens": {},
 }
+
+_hydrate_controller_config()
 
 
 class BackgroundTaskRunner:
@@ -301,12 +389,14 @@ def summarize_node_health(nodes: List[Dict[str, Any]]) -> Dict[str, Any]:
 
 
 def remediation_config() -> Dict[str, Any]:
+    cfg = controller_config()
     return {
-        "enabled": AUTO_REMEDIATE_ENABLED,
-        "interval_seconds": AUTO_REMEDIATE_INTERVAL,
-        "max_service_restarts": AUTO_REMEDIATE_MAX_RESTARTS,
-        "cooldown_seconds": AUTO_REMEDIATE_COOLDOWN_SECONDS,
-        "min_managers": AUTO_REMEDIATE_MIN_MANAGERS,
+        "enabled": cfg.get("auto_remediate_enabled", False),
+        "interval_seconds": cfg.get("auto_remediate_interval"),
+        "max_service_restarts": cfg.get("auto_remediate_max_restarts"),
+        "cooldown_seconds": cfg.get("auto_remediate_cooldown_seconds"),
+        "min_managers": cfg.get("auto_remediate_min_managers"),
+        "event_buffer": cfg.get("auto_remediate_event_buffer"),
     }
 
 
@@ -419,10 +509,21 @@ def _register_attempt(service_id: str) -> None:
 
 
 def remediate_services(services: List[Dict[str, Any]]) -> None:
+    overrides = service_automation_overrides()
     health = evaluate_service_health(services)
     unhealthy = {s.get("id"): s for s in health.get("under_replicated", []) + health.get("unstable", [])}
 
     for service_id, service_data in unhealthy.items():
+        settings = overrides.get(service_id, {})
+        if settings.get("automation_paused") or not settings.get("auto_remediate", True):
+            record_remediation_event(
+                "service-skip",
+                service_data.get("name", service_id),
+                "skipped",
+                "Automation paused for this service.",
+            )
+            continue
+
         if not _within_limits(service_id):
             record_remediation_event(
                 "service-skip",
@@ -608,10 +709,20 @@ def record_service_metrics(services: List[Dict[str, Any]], host: Dict[str, Any])
             continue
 
         bucket = services_bucket.setdefault(
-            service_id, {"history": [], "name": svc.get("name"), "auto_scale": False}
+            service_id,
+            {
+                "history": [],
+                "name": svc.get("name"),
+                "auto_scale": False,
+                "auto_remediate": True,
+                "automation_paused": False,
+            },
         )
         bucket["name"] = svc.get("name")
         bucket.setdefault("history", [])
+        bucket.setdefault("auto_remediate", True)
+        bucket.setdefault("automation_paused", False)
+        bucket.setdefault("auto_scale", False)
 
         task_states = svc.get("task_states", {}) or {}
         failures = int(task_states.get("failed", 0)) + int(task_states.get("shutdown", 0))
@@ -635,6 +746,60 @@ def record_service_metrics(services: List[Dict[str, Any]], host: Dict[str, Any])
     store["last_updated"] = now
     _persist_metrics_store(store)
     return store
+
+
+def service_automation_overrides() -> Dict[str, Dict[str, Any]]:
+    store = _load_metrics_store()
+    services_bucket = store.get("services", {}) if isinstance(store, dict) else {}
+    overrides: Dict[str, Dict[str, Any]] = {}
+    for service_id, bucket in services_bucket.items():
+        overrides[service_id] = {
+            "name": bucket.get("name"),
+            "auto_scale": bool(bucket.get("auto_scale", False)),
+            "auto_remediate": bool(bucket.get("auto_remediate", True)),
+            "automation_paused": bool(bucket.get("automation_paused", False)),
+        }
+    return overrides
+
+
+def update_service_automation(
+    service_id: str,
+    *,
+    name: str | None = None,
+    auto_scale: bool | None = None,
+    auto_remediate: bool | None = None,
+    automation_paused: bool | None = None,
+) -> Dict[str, Any]:
+    store = _load_metrics_store()
+    services_bucket = store.setdefault("services", {})
+    bucket = services_bucket.setdefault(
+        service_id,
+        {
+            "history": [],
+            "name": name,
+            "auto_scale": False,
+            "auto_remediate": True,
+            "automation_paused": False,
+        },
+    )
+    if name is not None:
+        bucket["name"] = name
+    if auto_scale is not None:
+        bucket["auto_scale"] = bool(auto_scale)
+    if auto_remediate is not None:
+        bucket["auto_remediate"] = bool(auto_remediate)
+    if automation_paused is not None:
+        bucket["automation_paused"] = bool(automation_paused)
+
+    services_bucket[service_id] = bucket
+    _persist_metrics_store(store)
+
+    return {
+        "service": service_id,
+        "auto_scale": bucket.get("auto_scale", False),
+        "auto_remediate": bucket.get("auto_remediate", True),
+        "automation_paused": bucket.get("automation_paused", False),
+    }
 
 
 def forecast_replicas(service_id: str, service_data: Dict[str, Any], current_replicas: int | None) -> Dict[str, Any]:
@@ -688,6 +853,7 @@ def build_forecast_snapshot(services: List[Dict[str, Any]]) -> Dict[str, Any]:
                 **recommendation,
                 "service_name": svc.get("name"),
                 "auto_scale": bucket.get("auto_scale", False),
+                "automation_paused": bucket.get("automation_paused", False),
                 "current_replicas": svc.get("replicas") or svc.get("desired"),
                 "recent": bucket.get("history", [])[-5:],
             }
@@ -784,6 +950,9 @@ def scaler_loop() -> None:
                     continue
 
                 bucket = store.get("services", {}).get(svc_id, {})
+                if bucket.get("automation_paused"):
+                    continue
+
                 if not bucket.get("auto_scale"):
                     continue
 
@@ -1140,6 +1309,8 @@ def summary() -> Any:
     insights = build_insights(host, nodes, services)
     metrics_store = record_service_metrics(services, host)
     forecasts = build_forecast_snapshot(services)
+    cfg = controller_config()
+    automation_overrides = service_automation_overrides()
     data = {
         "cluster": {
             "node_id": swarm.get("NodeID"),
@@ -1162,11 +1333,16 @@ def summary() -> Any:
             "events": list(REMEDIATION_EVENTS)[:20],
         },
         "autoscaler": {
-            "enabled": AUTO_SCALE_ENABLED,
-            "interval_seconds": AUTO_SCALE_INTERVAL,
+            "enabled": cfg.get("auto_scale_enabled"),
+            "interval_seconds": cfg.get("auto_scale_interval"),
+            "smoothing": cfg.get("auto_scale_smoothing"),
+            "min_replicas": cfg.get("auto_scale_min_replicas"),
+            "history_limit": cfg.get("auto_scale_history_limit"),
+            "failure_weight": cfg.get("auto_scale_failure_weight"),
             "last_metrics": metrics_store.get("last_updated"),
             "events": list(scale_events),
         },
+        "service_automation": automation_overrides,
         "timestamp": dt.datetime.utcnow().isoformat() + "Z",
     }
     return jsonify(data)
@@ -1186,6 +1362,8 @@ def admin() -> Any:
         join_tokens = stored_swarm.get("tokens", {}) if isinstance(stored_swarm, dict) else {}
         advertise_addr = stored_swarm.get("advertise_addr") if isinstance(stored_swarm, dict) else None
     services = summarize_services()
+    controller_cfg = controller_config()
+    automation_overrides = service_automation_overrides()
 
     return jsonify(
         {
@@ -1198,6 +1376,8 @@ def admin() -> Any:
             "forecasts": build_forecast_snapshot(services),
             "autoscaler_events": list(scale_events),
             "llm": texture_llm_status(),
+            "controller_config": controller_cfg,
+            "service_automation": automation_overrides,
             "onboarding": onboarding_snapshot(),
         }
     )
@@ -1360,18 +1540,43 @@ def set_service_autoscale(service_id: str) -> Any:
     payload = request.get_json(silent=True) or {}
     enabled = bool(payload.get("enabled", False))
 
-    store = _load_metrics_store()
-    services_bucket = store.setdefault("services", {})
-    bucket = services_bucket.setdefault(service_id, {"history": [], "auto_scale": False})
-    bucket["auto_scale"] = enabled
-    _persist_metrics_store(store)
+    data = update_service_automation(service_id, auto_scale=enabled)
+    return jsonify(data)
 
-    return jsonify({"service": service_id, "auto_scale": enabled})
+
+@app.post("/api/services/<service_id>/automation")
+def set_service_automation(service_id: str) -> Any:
+    payload = request.get_json(silent=True) or {}
+    name = payload.get("name")
+    auto_scale = payload.get("auto_scale")
+    auto_remediate = payload.get("auto_remediate")
+    paused = payload.get("paused")
+
+    data = update_service_automation(
+        service_id,
+        name=str(name) if name else None,
+        auto_scale=bool(auto_scale) if auto_scale is not None else None,
+        auto_remediate=bool(auto_remediate) if auto_remediate is not None else None,
+        automation_paused=bool(paused) if paused is not None else None,
+    )
+    return jsonify(data)
 
 
 @app.get("/api/admin/repo-status")
 def repo_status() -> Any:
     return jsonify(repo_update_status(False))
+
+
+@app.get("/api/admin/controller-config")
+def get_controller_config() -> Any:
+    return jsonify({"config": controller_config()})
+
+
+@app.post("/api/admin/controller-config")
+def set_controller_config() -> Any:
+    payload = request.get_json(silent=True) or {}
+    updated = _apply_controller_config(payload, persist=True)
+    return jsonify({"config": updated})
 
 
 @app.post("/api/admin/update")

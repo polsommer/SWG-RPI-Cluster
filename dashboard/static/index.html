@@ -211,6 +211,13 @@
     const TOKEN_KEY = 'swarmAuthToken';
     let nodesCache = [];
     let onboardingTimer = null;
+    let remediationEventsCache = [];
+    let scalerEventsCache = [];
+    let remediationFilter = 'all';
+    let scalerFilter = 'all';
+    let lastRemediationConfig = {};
+    let lastForecastServices = [];
+    let lastAutoscalerConfig = {};
 
     function getStoredToken() {
       return sessionStorage.getItem(TOKEN_KEY) || localStorage.getItem(TOKEN_KEY) || '';
@@ -410,15 +417,26 @@
 
       const cfg = data.config || {};
       const events = data.events || [];
+      lastRemediationConfig = cfg;
+      remediationEventsCache = events;
       const status = cfg.enabled ? 'Enabled' : 'Disabled';
       const limitInfo = `${cfg.max_service_restarts ?? '-'} restarts, ${cfg.cooldown_seconds ?? '-'}s cooldown`;
       const intervalInfo = `${cfg.interval_seconds ?? '-'}s cadence • Manager floor: ${cfg.min_managers ?? '-'}`;
-      const list = events.length ? `<ul class="event-log">${events.map(e => `
+      const filtered = remediationFilter === 'all' ? events : events.filter(e => (e.status || '').toLowerCase() === remediationFilter);
+      const filterControl = `<label class="muted" style="display:flex; align-items:center; gap:6px;">Filter
+        <select onchange="setRemediationFilter(this.value)" value="${remediationFilter}">
+          <option value="all" ${remediationFilter === 'all' ? 'selected' : ''}>All</option>
+          <option value="success" ${remediationFilter === 'success' ? 'selected' : ''}>Success</option>
+          <option value="skipped" ${remediationFilter === 'skipped' ? 'selected' : ''}>Skipped</option>
+          <option value="error" ${remediationFilter === 'error' ? 'selected' : ''}>Errors</option>
+        </select>
+      </label>`;
+      const list = filtered.length ? `<ul class="event-log">${filtered.map(e => `
         <li>
           <div class="event-meta"><strong>${e.action}</strong><span class="pill ${e.status === 'success' ? 'good' : e.status === 'skipped' ? 'neutral' : 'bad'}">${e.status}</span><span>${new Date(e.ts).toLocaleString()}</span></div>
           <div class="muted">Target: ${e.target}</div>
           <div>${e.message || ''}</div>
-        </li>`).join('')}</ul>` : '<div class="muted">No remediation actions taken yet.</div>';
+        </li>`).join('')}</ul>` : '<div class="muted">No remediation actions match this filter.</div>';
 
       root.innerHTML = `
         <div class="toolbar" style="justify-content: space-between; flex-wrap: wrap;">
@@ -427,6 +445,7 @@
         </div>
         <div class="muted">${limitInfo}</div>
         <div class="muted">${intervalInfo}</div>
+        <div class="toolbar" style="justify-content: space-between;">${filterControl}<div class="muted">Buffer: ${cfg.event_buffer || '-'}</div></div>
         <div class="stacked">${list}</div>
       `;
     }
@@ -435,10 +454,14 @@
       const root = document.getElementById('forecast-card');
       if (!root) return;
       const services = (data && data.services) || [];
+      lastForecastServices = services;
+      lastAutoscalerConfig = autoscaler || {};
       const serviceList = services.length ? services.map(s => {
         const load = Math.max(s.predicted_cpu || 0, s.predicted_mem || 0).toFixed(1);
         const response = s.predicted_response_ms ? `${s.predicted_response_ms.toFixed(1)} ms` : 'n/a';
-        const autoBadge = s.auto_scale ? '<span class="pill good">Auto</span>' : '<span class="pill bad">Manual</span>';
+        const statusText = s.automation_paused ? 'Paused' : (s.auto_scale ? 'Auto' : 'Manual');
+        const statusClass = s.automation_paused ? 'neutral' : (s.auto_scale ? 'good' : 'bad');
+        const autoBadge = `<span class="pill ${statusClass}">${statusText}</span>`;
         return `<div class="control-row" style="align-items: flex-start;">
           <div style="flex:1;">
             <strong>${s.service_name || s.service_id}</strong>
@@ -449,8 +472,20 @@
         </div>`;
       }).join('') : '<div class="muted">No services detected yet.</div>';
 
-      const events = (autoscaler?.events || []).slice(0,5);
-      const eventLog = events.length ? `<ul class="event-log">${events.map(e => `
+      const events = autoscaler?.events || [];
+      scalerEventsCache = events;
+      const filteredEvents = scalerFilter === 'all'
+        ? events.slice(0, 20)
+        : events.filter(e => (e.status || '').toLowerCase() === scalerFilter).slice(0, 20);
+      const filterControl = `<label class="muted" style="display:flex; gap:6px; align-items:center;">Filter
+        <select onchange="setScalerFilter(this.value)">
+          <option value="all" ${scalerFilter === 'all' ? 'selected' : ''}>All</option>
+          <option value="applied" ${scalerFilter === 'applied' ? 'selected' : ''}>Applied</option>
+          <option value="error" ${scalerFilter === 'error' ? 'selected' : ''}>Errors</option>
+          <option value="skipped" ${scalerFilter === 'skipped' ? 'selected' : ''}>Skipped</option>
+        </select>
+      </label>`;
+      const eventLog = filteredEvents.length ? `<ul class="event-log">${filteredEvents.map(e => `
         <li>
           <div class="event-meta"><strong>${e.service}</strong><span class="pill ${e.status === 'applied' ? 'good' : e.status === 'error' ? 'bad' : 'neutral'}">${e.status}</span><span>${new Date(e.ts).toLocaleString()}</span></div>
           <div class="muted">Replicas: ${e.replicas ?? '-'}</div>
@@ -462,9 +497,11 @@
           <div><strong>Status:</strong> ${autoscaler?.enabled ? 'Enabled' : 'Disabled'}</div>
           <span class="pill ${autoscaler?.enabled ? 'good' : 'bad'}">${autoscaler?.enabled ? 'Enabled' : 'Disabled'}</span>
         </div>
-        <div class="muted">Sampling every ${autoscaler?.interval_seconds ?? '-'}s • Last metrics: ${autoscaler?.last_metrics || 'n/a'}</div>
+        <div class="muted">Sampling every ${autoscaler?.interval_seconds ?? '-'}s • Smoothing: ${autoscaler?.smoothing ?? '-'} • Minimum replicas: ${autoscaler?.min_replicas ?? '-'}</div>
+        <div class="muted">History limit: ${autoscaler?.history_limit ?? '-'} • Failure weight: ${autoscaler?.failure_weight ?? '-'}</div>
         <div class="stacked">${serviceList}</div>
         <div class="muted">Recent scaler decisions</div>
+        <div class="toolbar" style="justify-content: space-between;">${filterControl}<div class="muted">Last metrics: ${autoscaler?.last_metrics || 'n/a'}</div></div>
         ${eventLog}
       `;
     }
@@ -500,6 +537,16 @@
       pill.className = `pill ${ok ? 'good' : 'bad'}`;
       pill.style.display = 'inline-flex';
       setTimeout(() => pill.style.display = 'none', 3000);
+    }
+
+    function setRemediationFilter(value) {
+      remediationFilter = value;
+      renderRemediation({ config: lastRemediationConfig, events: remediationEventsCache });
+    }
+
+    function setScalerFilter(value) {
+      scalerFilter = value;
+      renderForecasts({ services: lastForecastServices }, { ...lastAutoscalerConfig, events: scalerEventsCache });
     }
 
     async function rotateTokens() {
@@ -681,20 +728,34 @@
       }
     }
 
-    async function toggleAutoScale(serviceId, enabled) {
+    async function updateServiceAutomation(serviceId, payload, successMessage = 'Updated automation settings') {
       try {
-        const res = await authedFetch(`/api/services/${serviceId}/autoscale`, {
+        const res = await authedFetch(`/api/services/${serviceId}/automation`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ enabled })
+          body: JSON.stringify(payload)
         });
-        if (!res.ok) throw new Error('Unable to toggle autoscale');
-        setStatus(`Auto-scale ${enabled ? 'enabled' : 'disabled'} for ${serviceId}`, true);
+        const data = await res.json();
+        if (!res.ok || data.error) throw new Error(data.error || 'Unable to update automation');
+        setStatus(successMessage, true);
         await refreshAdmin();
+        await refresh();
       } catch (err) {
         console.error(err);
-        setStatus('Unable to update auto-scale preference', false);
+        setStatus(err.message || 'Unable to update automation', false);
       }
+    }
+
+    async function toggleAutoScale(serviceId, enabled) {
+      return updateServiceAutomation(serviceId, { auto_scale: enabled }, `Auto-scale ${enabled ? 'enabled' : 'disabled'} for ${serviceId}`);
+    }
+
+    async function toggleAutoRemediate(serviceId, enabled) {
+      return updateServiceAutomation(serviceId, { auto_remediate: enabled }, `Auto-remediation ${enabled ? 'enabled' : 'disabled'} for ${serviceId}`);
+    }
+
+    async function toggleAutomationPause(serviceId, paused) {
+      return updateServiceAutomation(serviceId, { paused }, paused ? `Automation paused for ${serviceId}` : `Automation resumed for ${serviceId}`);
     }
 
     function onboardingMarkup(onboarding) {
@@ -819,6 +880,8 @@
       const services = (data.services || []).filter(s => s.mode === 'replicated');
       const forecasts = (data.forecasts?.services) || [];
       const forecastMap = Object.fromEntries(forecasts.map(f => [f.service_id, f]));
+      const controllerCfg = data.controller_config || {};
+      const serviceAutomation = data.service_automation || {};
       const repo = data.repo || {};
 
       const repoStatus = repo.error ? `<span class="muted">${repo.error}</span>` : `
@@ -829,7 +892,7 @@
       const onboardingHtml = onboardingMarkup(data.onboarding);
 
       $('#admin-panel').innerHTML = `
-        ${onboardingHtml}
+            ${onboardingHtml}
         <div class="control-row" style="flex-direction: column; align-items: flex-start;">
           <div class="toolbar" style="width: 100%; justify-content: space-between; gap: 12px; flex-wrap: wrap;">
             <div><strong>Join Tokens</strong><div class="muted">Hand these to operators to add nodes instantly.</div></div>
@@ -850,6 +913,29 @@
               </div>
               <button class="btn ghost" onclick="copyCommand('manager-command')">Copy</button>
             </div>
+          </div>
+        </div>
+        <div class="control-row" style="flex-direction: column; align-items: stretch;">
+          <div class="toolbar" style="justify-content: space-between; flex-wrap: wrap;">
+            <div><strong>Automation controls</strong><div class="muted">Tune remediation cadence and autoscaler weights live.</div></div>
+            <div class="toolbar" style="gap: 8px; flex-wrap: wrap;">
+              <div class="muted">Applies immediately</div>
+              <button class="btn" onclick="saveControllerConfig()">Save settings</button>
+            </div>
+          </div>
+          <div class="wizard-grid">
+            <label><span>Auto-remediation</span><label class="muted" style="display:flex; gap:6px; align-items:center;"><input type="checkbox" id="auto-remediate-enabled" ${controllerCfg.auto_remediate_enabled ? 'checked' : ''}/> Enabled</label></label>
+            <label>Interval (s)<input id="auto-remediate-interval" type="number" min="5" value="${controllerCfg.auto_remediate_interval ?? 30}" /></label>
+            <label>Max restarts<input id="auto-remediate-max" type="number" min="1" value="${controllerCfg.auto_remediate_max_restarts ?? 3}" /></label>
+            <label>Cooldown (s)<input id="auto-remediate-cooldown" type="number" min="30" value="${controllerCfg.auto_remediate_cooldown_seconds ?? 180}" /></label>
+            <label>Min managers<input id="auto-remediate-min-managers" type="number" min="1" value="${controllerCfg.auto_remediate_min_managers ?? 1}" /></label>
+            <label>Event buffer<input id="auto-remediate-buffer" type="number" min="50" value="${controllerCfg.auto_remediate_event_buffer ?? 200}" /></label>
+            <label><span>Auto-scale</span><label class="muted" style="display:flex; gap:6px; align-items:center;"><input type="checkbox" id="auto-scale-enabled" ${controllerCfg.auto_scale_enabled ? 'checked' : ''}/> Enabled</label></label>
+            <label>Interval (s)<input id="auto-scale-interval" type="number" min="5" value="${controllerCfg.auto_scale_interval ?? 30}" /></label>
+            <label>Smoothing<input id="auto-scale-smoothing" type="number" step="0.05" min="0" max="1" value="${controllerCfg.auto_scale_smoothing ?? 0.35}" /></label>
+            <label>Min replicas<input id="auto-scale-min" type="number" min="1" value="${controllerCfg.auto_scale_min_replicas ?? 1}" /></label>
+            <label>History limit<input id="auto-scale-history" type="number" min="20" value="${controllerCfg.auto_scale_history_limit ?? 200}" /></label>
+            <label>Failure weight<input id="auto-scale-failure-weight" type="number" step="0.1" min="0" value="${controllerCfg.auto_scale_failure_weight ?? 1.5}" /></label>
           </div>
         </div>
         <div class="control-row" style="flex-direction: column; align-items: stretch;">
@@ -911,7 +997,10 @@
               const forecast = forecastMap[s.id] || {};
               const recommended = forecast.recommended_replicas ?? current;
               const load = Math.max(forecast.predicted_cpu || 0, forecast.predicted_mem || 0).toFixed(1);
-              const autoScale = !!forecast.auto_scale;
+              const automation = serviceAutomation[s.id] || {};
+              const autoScale = automation.auto_scale ?? !!forecast.auto_scale;
+              const autoRemediate = automation.auto_remediate ?? true;
+              const paused = automation.automation_paused ?? false;
               return `
                 <div class="control-row">
                   <div style="flex:1;">
@@ -926,6 +1015,12 @@
                     <button class="btn" onclick="scaleService('${s.id}', '${inputId}')">Apply</button>
                     <label class="muted" style="display:flex; gap:6px; align-items:center;">
                       <input type="checkbox" ${autoScale ? 'checked' : ''} onchange="toggleAutoScale('${s.id}', this.checked)" /> Auto-scale
+                    </label>
+                    <label class="muted" style="display:flex; gap:6px; align-items:center;">
+                      <input type="checkbox" ${autoRemediate ? 'checked' : ''} onchange="toggleAutoRemediate('${s.id}', this.checked)" /> Auto-remediate
+                    </label>
+                    <label class="muted" style="display:flex; gap:6px; align-items:center;">
+                      <input type="checkbox" ${paused ? 'checked' : ''} onchange="toggleAutomationPause('${s.id}', this.checked)" /> Pause automation
                     </label>
                   </div>
                 </div>
@@ -980,6 +1075,39 @@
       } catch (err) {
         console.error(err);
         setStatus(err.message || 'Unable to apply updates', false);
+      }
+    }
+
+    async function saveControllerConfig() {
+      const payload = {
+        auto_remediate_enabled: document.getElementById('auto-remediate-enabled')?.checked,
+        auto_remediate_interval: Number(document.getElementById('auto-remediate-interval')?.value || 30),
+        auto_remediate_max_restarts: Number(document.getElementById('auto-remediate-max')?.value || 3),
+        auto_remediate_cooldown_seconds: Number(document.getElementById('auto-remediate-cooldown')?.value || 180),
+        auto_remediate_min_managers: Number(document.getElementById('auto-remediate-min-managers')?.value || 1),
+        auto_remediate_event_buffer: Number(document.getElementById('auto-remediate-buffer')?.value || 200),
+        auto_scale_enabled: document.getElementById('auto-scale-enabled')?.checked,
+        auto_scale_interval: Number(document.getElementById('auto-scale-interval')?.value || 30),
+        auto_scale_smoothing: Number(document.getElementById('auto-scale-smoothing')?.value || 0.35),
+        auto_scale_min_replicas: Number(document.getElementById('auto-scale-min')?.value || 1),
+        auto_scale_history_limit: Number(document.getElementById('auto-scale-history')?.value || 200),
+        auto_scale_failure_weight: Number(document.getElementById('auto-scale-failure-weight')?.value || 1.5),
+      };
+
+      try {
+        const res = await authedFetch('/api/admin/controller-config', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(payload)
+        });
+        const data = await res.json();
+        if (!res.ok || data.error) throw new Error(data.error || 'Unable to save controller config');
+        setStatus('Controller settings updated', true);
+        await refresh();
+        await refreshAdmin();
+      } catch (err) {
+        console.error(err);
+        setStatus(err.message || 'Unable to save configuration', false);
       }
     }
 
