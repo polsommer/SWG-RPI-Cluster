@@ -69,6 +69,13 @@
     .event-log li { border: 1px solid var(--card-border); padding: 10px; border-radius: 10px; background: rgba(255,255,255,0.03); }
     .event-meta { display: flex; gap: 10px; flex-wrap: wrap; color: var(--muted); font-size: 0.9rem; }
     .pill.neutral { background: rgba(255,255,255,0.08); color: var(--text); }
+    .wizard-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 10px; width: 100%; }
+    .wizard-grid label { display: flex; flex-direction: column; gap: 6px; font-weight: 600; }
+    .wizard-grid input, .wizard-grid textarea { padding: 10px; border-radius: 10px; border: 1px solid var(--card-border); background: rgba(0,0,0,0.25); color: var(--text); }
+    .wizard-grid textarea { min-height: 80px; resize: vertical; }
+    .log-line { display: grid; gap: 4px; padding: 10px; border: 1px solid var(--card-border); border-radius: 10px; background: rgba(255,255,255,0.04); }
+    .log-target { font-weight: 700; color: var(--muted); }
+    .log-message { white-space: pre-wrap; }
     @media (max-width: 720px) { header { flex-direction: column; align-items: flex-start; } }
   </style>
 </head>
@@ -203,6 +210,7 @@
     const REFRESH_MS = 5000;
     const TOKEN_KEY = 'swarmAuthToken';
     let nodesCache = [];
+    let onboardingTimer = null;
 
     function getStoredToken() {
       return sessionStorage.getItem(TOKEN_KEY) || localStorage.getItem(TOKEN_KEY) || '';
@@ -689,6 +697,118 @@
       }
     }
 
+    function onboardingMarkup(onboarding) {
+      const status = onboarding?.status || 'idle';
+      const validation = onboarding?.validation || {};
+      const disabled = status === 'running' || status === 'queued';
+      const pillClass = status === 'ready' ? 'good' : status === 'error' ? 'bad' : 'neutral';
+      const statusText = status.charAt(0).toUpperCase() + status.slice(1);
+      const logsByTarget = {};
+      (onboarding?.logs || []).forEach(entry => {
+        const key = entry.target || 'cluster';
+        logsByTarget[key] = logsByTarget[key] || [];
+        logsByTarget[key].push(entry);
+      });
+      const logBlocks = Object.entries(logsByTarget).map(([target, entries]) => `
+        <div class="stacked">
+          <div class="muted"><strong>${target}</strong></div>
+          ${entries.slice(-6).map(item => `
+            <div class="log-line">
+              <div class="log-target">${new Date(item.ts).toLocaleTimeString()} • ${item.level}</div>
+              <div class="log-message">${item.message}</div>
+            </div>
+          `).join('')}
+        </div>
+      `).join('') || '<div class="muted">No onboarding activity yet.</div>';
+
+      const readyNodes = validation.ready_nodes ?? 0;
+      const expectedNodes = validation.expected_nodes ?? '?';
+      const overlayState = validation.overlay ? 'present' : 'missing';
+      const healthLine = validation.ok ? `Nodes ready ${readyNodes}/${expectedNodes} • Overlay network ${overlayState}` : 'Waiting for health checks to pass...';
+      const tokenLine = onboarding?.tokens?.Worker ? `Worker token captured` : 'Tokens will be captured after swarm init';
+
+      return `
+        <div id="onboarding-live" class="control-row" style="flex-direction: column; align-items: stretch; gap: 12px;">
+          <div class="toolbar" style="justify-content: space-between; flex-wrap: wrap;">
+            <div><strong>Onboarding wizard</strong><div class="muted">Install Docker, init swarm, and join workers remotely.</div></div>
+            <span class="pill ${pillClass}">${statusText}</span>
+          </div>
+          <div class="wizard-grid">
+            <label>Manager address<input id="manager-address" type="text" placeholder="192.168.1.10" value="${onboarding?.manager || ''}" ${disabled ? 'disabled' : ''}></label>
+            <label>Worker addresses (comma or newline separated)<textarea id="worker-addresses" placeholder="192.168.1.11\n192.168.1.12" ${disabled ? 'disabled' : ''}>${(onboarding?.workers || []).join('\n')}</textarea></label>
+            <label>SSH user<input id="ssh-user" type="text" value="${onboarding?.ssh_user || 'pi'}" ${disabled ? 'disabled' : ''}></label>
+            <label>SSH key path<input id="ssh-key-path" type="text" placeholder="/home/pi/.ssh/id_rsa" value="${onboarding?.ssh_key_path || ''}" ${disabled ? 'disabled' : ''}></label>
+            <label>Advertise address<input id="advertise-addr" type="text" placeholder="manager:2377" value="${onboarding?.advertise_addr || ''}" ${disabled ? 'disabled' : ''}></label>
+          </div>
+          <div class="toolbar" style="justify-content: space-between; flex-wrap: wrap;">
+            <div class="muted">${healthLine}</div>
+            <div class="muted">${tokenLine}</div>
+            <button class="btn" onclick="startOnboarding()" ${disabled ? 'disabled' : ''}>Start onboarding</button>
+          </div>
+          <div class="stacked">${logBlocks}</div>
+        </div>
+      `;
+    }
+
+    function renderOnboardingPanel(onboarding) {
+      const mount = document.getElementById('onboarding-live');
+      const html = onboardingMarkup(onboarding || {});
+      if (mount) {
+        mount.outerHTML = html;
+      } else {
+        const panel = document.getElementById('admin-panel');
+        if (panel) panel.insertAdjacentHTML('afterbegin', html);
+      }
+    }
+
+    async function pollOnboarding() {
+      try {
+        const res = await authedFetch('/api/admin/onboarding/status');
+        const data = await res.json();
+        renderOnboardingPanel(data);
+        const status = data?.status || '';
+        if (['ready', 'error', 'idle'].includes(status) && onboardingTimer) {
+          clearInterval(onboardingTimer);
+          onboardingTimer = null;
+        }
+      } catch (err) {
+        console.error(err);
+      }
+    }
+
+    async function startOnboarding() {
+      const manager = document.getElementById('manager-address')?.value.trim();
+      const workersRaw = document.getElementById('worker-addresses')?.value || '';
+      const sshUser = document.getElementById('ssh-user')?.value.trim() || 'pi';
+      const sshKeyPath = document.getElementById('ssh-key-path')?.value.trim();
+      const advertise = document.getElementById('advertise-addr')?.value.trim();
+      const workers = workersRaw.split(/\n|,/).map(w => w.trim()).filter(Boolean);
+
+      if (!manager) {
+        setStatus('Enter a manager address', false);
+        return;
+      }
+
+      try {
+        const res = await authedFetch('/api/admin/onboarding/start', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ manager, workers, ssh_user: sshUser, ssh_key_path: sshKeyPath, advertise_addr: advertise })
+        });
+        const payload = await res.json();
+        if (!res.ok || payload.error) {
+          throw new Error(payload.error || 'Unable to start onboarding');
+        }
+        renderOnboardingPanel(payload);
+        setStatus('Onboarding started', true);
+        if (onboardingTimer) clearInterval(onboardingTimer);
+        onboardingTimer = setInterval(pollOnboarding, 3000);
+      } catch (err) {
+        console.error(err);
+        setStatus(err?.message || 'Unable to start onboarding', false);
+      }
+    }
+
     function renderAdmin(data) {
       const tokens = data.tokens || {};
       const advertise = data.advertise_addr || 'manager:2377';
@@ -706,7 +826,10 @@
         <div>${badge(repo.behind ? `${repo.behind} update(s) pending` : 'Up to date', !repo.behind)}</div>
       `;
 
+      const onboardingHtml = onboardingMarkup(data.onboarding);
+
       $('#admin-panel').innerHTML = `
+        ${onboardingHtml}
         <div class="control-row" style="flex-direction: column; align-items: flex-start;">
           <div class="toolbar" style="width: 100%; justify-content: space-between; gap: 12px; flex-wrap: wrap;">
             <div><strong>Join Tokens</strong><div class="muted">Hand these to operators to add nodes instantly.</div></div>
@@ -821,6 +944,11 @@
           <div class="stacked">${repoStatus}</div>
         </div>
       `;
+
+      const onboardingStatus = data?.onboarding?.status || '';
+      if (['running', 'queued'].includes(onboardingStatus) && !onboardingTimer) {
+        onboardingTimer = setInterval(pollOnboarding, 3000);
+      }
     }
 
     async function checkRepoStatus() {
