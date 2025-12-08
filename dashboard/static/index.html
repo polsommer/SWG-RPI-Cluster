@@ -115,6 +115,11 @@
       <div class="muted" style="margin-bottom: 8px;">Background controller events and safety rails.</div>
       <div class="stacked" id="remediation-card"></div>
     </div>
+    <div class="card" style="grid-column: 1 / -1;">
+      <h3>Forecasts &amp; Autoscaling</h3>
+      <div class="muted" style="margin-bottom: 8px;">Predicted load and replica recommendations with opt-in control.</div>
+      <div class="stacked" id="forecast-card"></div>
+    </div>
   </section>
 
   <section class="grid" style="padding-top: 0;" id="nodes">
@@ -266,6 +271,7 @@
       }).join('');
 
       renderRemediation(data.remediation);
+      renderForecasts(data.forecasts, data.autoscaler);
     }
 
     function renderInsights(data) {
@@ -319,6 +325,44 @@
         <div class="muted">${limitInfo}</div>
         <div class="muted">${intervalInfo}</div>
         <div class="stacked">${list}</div>
+      `;
+    }
+
+    function renderForecasts(data, autoscaler) {
+      const root = document.getElementById('forecast-card');
+      if (!root) return;
+      const services = (data && data.services) || [];
+      const serviceList = services.length ? services.map(s => {
+        const load = Math.max(s.predicted_cpu || 0, s.predicted_mem || 0).toFixed(1);
+        const response = s.predicted_response_ms ? `${s.predicted_response_ms.toFixed(1)} ms` : 'n/a';
+        const autoBadge = s.auto_scale ? '<span class="pill good">Auto</span>' : '<span class="pill bad">Manual</span>';
+        return `<div class="control-row" style="align-items: flex-start;">
+          <div style="flex:1;">
+            <strong>${s.service_name || s.service_id}</strong>
+            <div class="muted">Current: ${s.current_replicas ?? '-'} • Recommended: ${s.recommended_replicas}</div>
+            <div class="muted">Forecast CPU/Mem: ${load}% • Response: ${response}</div>
+          </div>
+          <div>${autoBadge}</div>
+        </div>`;
+      }).join('') : '<div class="muted">No services detected yet.</div>';
+
+      const events = (autoscaler?.events || []).slice(0,5);
+      const eventLog = events.length ? `<ul class="event-log">${events.map(e => `
+        <li>
+          <div class="event-meta"><strong>${e.service}</strong><span class="pill ${e.status === 'applied' ? 'good' : e.status === 'error' ? 'bad' : 'neutral'}">${e.status}</span><span>${new Date(e.ts).toLocaleString()}</span></div>
+          <div class="muted">Replicas: ${e.replicas ?? '-'}</div>
+          <div>${e.message || ''}</div>
+        </li>`).join('')}</ul>` : '<div class="muted">No scaler actions yet.</div>';
+
+      root.innerHTML = `
+        <div class="toolbar" style="justify-content: space-between; flex-wrap: wrap;">
+          <div><strong>Status:</strong> ${autoscaler?.enabled ? 'Enabled' : 'Disabled'}</div>
+          <span class="pill ${autoscaler?.enabled ? 'good' : 'bad'}">${autoscaler?.enabled ? 'Enabled' : 'Disabled'}</span>
+        </div>
+        <div class="muted">Sampling every ${autoscaler?.interval_seconds ?? '-'}s • Last metrics: ${autoscaler?.last_metrics || 'n/a'}</div>
+        <div class="stacked">${serviceList}</div>
+        <div class="muted">Recent scaler decisions</div>
+        ${eventLog}
       `;
     }
 
@@ -495,6 +539,22 @@
       }
     }
 
+    async function toggleAutoScale(serviceId, enabled) {
+      try {
+        const res = await fetch(`/api/services/${serviceId}/autoscale`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ enabled })
+        });
+        if (!res.ok) throw new Error('Unable to toggle autoscale');
+        setStatus(`Auto-scale ${enabled ? 'enabled' : 'disabled'} for ${serviceId}`, true);
+        await refreshAdmin();
+      } catch (err) {
+        console.error(err);
+        setStatus('Unable to update auto-scale preference', false);
+      }
+    }
+
     function renderAdmin(data) {
       const tokens = data.tokens || {};
       const advertise = data.advertise_addr || 'manager:2377';
@@ -503,6 +563,8 @@
 
       const nodes = data.nodes || [];
       const services = (data.services || []).filter(s => s.mode === 'replicated');
+      const forecasts = (data.forecasts?.services) || [];
+      const forecastMap = Object.fromEntries(forecasts.map(f => [f.service_id, f]));
       const repo = data.repo || {};
 
       const repoStatus = repo.error ? `<span class="muted">${repo.error}</span>` : `
@@ -579,17 +641,25 @@
             ${services.length ? services.map((s, idx) => {
               const inputId = `scale-${idx}`;
               const current = s.replicas ?? s.desired ?? 1;
+              const forecast = forecastMap[s.id] || {};
+              const recommended = forecast.recommended_replicas ?? current;
+              const load = Math.max(forecast.predicted_cpu || 0, forecast.predicted_mem || 0).toFixed(1);
+              const autoScale = !!forecast.auto_scale;
               return `
                 <div class="control-row">
                   <div style="flex:1;">
                     <strong>${s.name}</strong>
                     <div class="muted">${s.image}</div>
-                    <div class="muted">Current: ${s.running}/${s.desired}</div>
+                    <div class="muted">Current: ${s.running}/${s.desired} • Forecast load: ${load}%</div>
+                    <div class="muted">Suggested replicas: ${recommended}</div>
                   </div>
                   <div class="inline-input">
                     <label for="${inputId}" class="muted">Replicas</label>
-                    <input id="${inputId}" type="number" min="0" value="${current}" />
+                    <input id="${inputId}" type="number" min="0" value="${recommended}" />
                     <button class="btn" onclick="scaleService('${s.id}', '${inputId}')">Apply</button>
+                    <label class="muted" style="display:flex; gap:6px; align-items:center;">
+                      <input type="checkbox" ${autoScale ? 'checked' : ''} onchange="toggleAutoScale('${s.id}', this.checked)" /> Auto-scale
+                    </label>
                   </div>
                 </div>
               `;
