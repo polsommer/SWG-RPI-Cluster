@@ -34,6 +34,7 @@ except DockerException as exc:  # pragma: no cover - exercised in tests
 REPO_ROOT = Path(__file__).resolve().parents[1]
 METRICS_STORE = Path(os.environ.get("METRICS_STORE", "/tmp/service_metrics.json"))
 METRICS_LOCK = threading.Lock()
+CONFIG_LOCK = threading.Lock()
 AUTH_TOKEN = os.environ.get("DASHBOARD_AUTH_TOKEN", "").strip()
 PROTECTED_PATH_PREFIXES = ("/api/admin", "/api/nodes", "/api/services")
 CONTROLLER_LOCK_FILE = Path(os.environ.get("DASHBOARD_CONTROLLER_LOCK", "/tmp/dashboard_controller.lock"))
@@ -78,12 +79,12 @@ def require_authentication() -> Any:
 
 def _load_metrics_store() -> Dict[str, Any]:
     if not METRICS_STORE.exists():
-        return {"services": {}, "last_updated": None}
+        return {"services": {}, "last_updated": None, "settings": DEFAULT_SETTINGS}
     try:
         with METRICS_STORE.open() as fh:
-            return {"services": {}, "last_updated": None} | (json.load(fh) or {})
+            return {"services": {}, "last_updated": None, "settings": DEFAULT_SETTINGS} | (json.load(fh) or {})
     except Exception:  # noqa: BLE001
-        return {"services": {}, "last_updated": None}
+        return {"services": {}, "last_updated": None, "settings": DEFAULT_SETTINGS}
 
 
 def _persist_metrics_store(store: Dict[str, Any]) -> None:
@@ -91,6 +92,52 @@ def _persist_metrics_store(store: Dict[str, Any]) -> None:
     with METRICS_LOCK:
         with METRICS_STORE.open("w") as fh:
             json.dump(store, fh, indent=2)
+
+
+def _merge_settings(settings: Dict[str, Any]) -> Dict[str, Any]:
+    with CONFIG_LOCK:
+        current = json.loads(json.dumps(RUNTIME_CONFIG)) if RUNTIME_CONFIG else {}
+
+    merged = json.loads(json.dumps(DEFAULT_SETTINGS))
+    merged.update({k: v for k, v in settings.items() if k != "settings"})
+    merged["remediation"].update(current.get("remediation", {}))
+    merged["autoscale"].update(current.get("autoscale", {}))
+    merged["service_overrides"].update(current.get("service_overrides", {}))
+    merged["remediation"].update(settings.get("remediation", {}))
+    merged["autoscale"].update(settings.get("autoscale", {}))
+    merged["service_overrides"].update(settings.get("service_overrides", {}))
+    return merged
+
+
+def _resize_remediation_buffer(size: int) -> None:
+    global REMEDIATION_EVENTS
+    try:
+        size_int = max(1, int(size))
+    except Exception:  # noqa: BLE001
+        size_int = DEFAULT_SETTINGS["remediation"]["event_buffer"]
+    with remediation_lock:
+        REMEDIATION_EVENTS = deque(REMEDIATION_EVENTS, maxlen=size_int)
+
+
+def load_runtime_settings() -> None:
+    global RUNTIME_CONFIG
+    store = _load_metrics_store()
+    settings = store.get("settings", {}) or {}
+    merged = _merge_settings(settings)
+    with CONFIG_LOCK:
+        RUNTIME_CONFIG = merged
+    _resize_remediation_buffer(merged.get("remediation", {}).get("event_buffer", AUTO_REMEDIATE_EVENT_BUFFER))
+
+
+def persist_runtime_settings(settings: Dict[str, Any]) -> Dict[str, Any]:
+    store = _load_metrics_store()
+    merged = _merge_settings(settings)
+    store["settings"] = merged
+    _persist_metrics_store(store)
+    with CONFIG_LOCK:
+        RUNTIME_CONFIG = merged
+    _resize_remediation_buffer(merged.get("remediation", {}).get("event_buffer", AUTO_REMEDIATE_EVENT_BUFFER))
+    return merged
 
 
 def exponential_smoothing(values: List[float], alpha: float, default: float | None = None) -> float | None:
@@ -117,6 +164,28 @@ AUTO_SCALE_MIN_REPLICAS = int(os.environ.get("AUTO_SCALE_MIN_REPLICAS", "1"))
 AUTO_SCALE_HISTORY_LIMIT = int(os.environ.get("AUTO_SCALE_HISTORY_LIMIT", "200"))
 AUTO_SCALE_FAILURE_WEIGHT = float(os.environ.get("AUTO_SCALE_FAILURE_WEIGHT", "1.5"))
 
+DEFAULT_SETTINGS = {
+    "remediation": {
+        "enabled": AUTO_REMEDIATE_ENABLED,
+        "interval_seconds": AUTO_REMEDIATE_INTERVAL,
+        "max_service_restarts": AUTO_REMEDIATE_MAX_RESTARTS,
+        "cooldown_seconds": AUTO_REMEDIATE_COOLDOWN_SECONDS,
+        "min_managers": AUTO_REMEDIATE_MIN_MANAGERS,
+        "event_buffer": AUTO_REMEDIATE_EVENT_BUFFER,
+    },
+    "autoscale": {
+        "enabled": AUTO_SCALE_ENABLED,
+        "interval_seconds": AUTO_SCALE_INTERVAL,
+        "smoothing": AUTO_SCALE_SMOOTHING,
+        "min_replicas": AUTO_SCALE_MIN_REPLICAS,
+        "history_limit": AUTO_SCALE_HISTORY_LIMIT,
+        "failure_weight": AUTO_SCALE_FAILURE_WEIGHT,
+    },
+    "service_overrides": {},
+}
+
+RUNTIME_CONFIG: Dict[str, Any] = {"remediation": {}, "autoscale": {}, "service_overrides": {}}
+
 TEXTURE_LLM_NAME = os.environ.get("TEXTURE_LLM_NAME", "Texture LLM")
 TEXTURE_LLM_ENDPOINT = os.environ.get("TEXTURE_LLM_ENDPOINT")
 TEXTURE_LLM_ENABLED = _bool_env("TEXTURE_LLM_ENABLED", True)
@@ -128,6 +197,8 @@ remediation_thread_started = False
 scaler_thread_started = False
 scale_events: deque[Dict[str, Any]] = deque(maxlen=100)
 controller_lock = threading.Lock()
+
+load_runtime_settings()
 
 
 def format_duration(seconds: float) -> str:
@@ -196,13 +267,18 @@ def summarize_node_health(nodes: List[Dict[str, Any]]) -> Dict[str, Any]:
 
 
 def remediation_config() -> Dict[str, Any]:
-    return {
-        "enabled": AUTO_REMEDIATE_ENABLED,
-        "interval_seconds": AUTO_REMEDIATE_INTERVAL,
-        "max_service_restarts": AUTO_REMEDIATE_MAX_RESTARTS,
-        "cooldown_seconds": AUTO_REMEDIATE_COOLDOWN_SECONDS,
-        "min_managers": AUTO_REMEDIATE_MIN_MANAGERS,
-    }
+    with CONFIG_LOCK:
+        return json.loads(json.dumps(RUNTIME_CONFIG.get("remediation", DEFAULT_SETTINGS["remediation"])))
+
+
+def autoscale_config() -> Dict[str, Any]:
+    with CONFIG_LOCK:
+        return json.loads(json.dumps(RUNTIME_CONFIG.get("autoscale", DEFAULT_SETTINGS["autoscale"])))
+
+
+def service_overrides() -> Dict[str, Any]:
+    with CONFIG_LOCK:
+        return json.loads(json.dumps(RUNTIME_CONFIG.get("service_overrides", {})))
 
 
 def texture_llm_status() -> Dict[str, Any]:
@@ -296,11 +372,12 @@ def evaluate_service_health(services: List[Dict[str, Any]]) -> Dict[str, Any]:
 
 
 def _within_limits(service_id: str) -> bool:
+    cfg = remediation_config()
     now = time.time()
     meta = SERVICE_ATTEMPTS.get(service_id, {"count": 0, "last": 0.0})
-    if now - meta.get("last", 0) > AUTO_REMEDIATE_COOLDOWN_SECONDS:
+    if now - meta.get("last", 0) > cfg.get("cooldown_seconds", AUTO_REMEDIATE_COOLDOWN_SECONDS):
         meta = {"count": 0, "last": 0.0}
-    if meta["count"] >= AUTO_REMEDIATE_MAX_RESTARTS:
+    if meta["count"] >= cfg.get("max_service_restarts", AUTO_REMEDIATE_MAX_RESTARTS):
         return False
     SERVICE_ATTEMPTS[service_id] = meta
     return True
@@ -316,8 +393,17 @@ def _register_attempt(service_id: str) -> None:
 def remediate_services(services: List[Dict[str, Any]]) -> None:
     health = evaluate_service_health(services)
     unhealthy = {s.get("id"): s for s in health.get("under_replicated", []) + health.get("unstable", [])}
+    overrides = service_overrides()
 
     for service_id, service_data in unhealthy.items():
+        if overrides.get(service_id, {}).get("remediation_paused"):
+            record_remediation_event(
+                "service-skip",
+                service_data.get("name", service_id),
+                "skipped",
+                "Remediation paused for this service",
+            )
+            continue
         if not _within_limits(service_id):
             record_remediation_event(
                 "service-skip",
@@ -373,8 +459,9 @@ def _drain_unreachable_nodes(nodes: List[Dict[str, Any]]) -> None:
 
 
 def _promote_managers(nodes: List[Dict[str, Any]]) -> None:
+    cfg = remediation_config()
     healthy_managers = [n for n in nodes if n.get("role") == "manager" and node_health_state(n) == "healthy"]
-    if len(healthy_managers) >= AUTO_REMEDIATE_MIN_MANAGERS:
+    if len(healthy_managers) >= cfg.get("min_managers", AUTO_REMEDIATE_MIN_MANAGERS):
         return
 
     candidates = [
@@ -496,6 +583,8 @@ def record_service_metrics(services: List[Dict[str, Any]], host: Dict[str, Any])
     store = _load_metrics_store()
     services_bucket = store.setdefault("services", {})
     now = dt.datetime.utcnow().isoformat() + "Z"
+    autoscale_cfg = autoscale_config()
+    history_limit = autoscale_cfg.get("history_limit", AUTO_SCALE_HISTORY_LIMIT)
 
     for svc in services:
         service_id = svc.get("id")
@@ -524,8 +613,8 @@ def record_service_metrics(services: List[Dict[str, Any]], host: Dict[str, Any])
             }
         )
 
-        if len(bucket["history"]) > AUTO_SCALE_HISTORY_LIMIT:
-            bucket["history"] = bucket["history"][-AUTO_SCALE_HISTORY_LIMIT:]
+        if len(bucket["history"]) > history_limit:
+            bucket["history"] = bucket["history"][-history_limit:]
 
     store["last_updated"] = now
     _persist_metrics_store(store)
@@ -539,21 +628,26 @@ def forecast_replicas(service_id: str, service_data: Dict[str, Any], current_rep
     failure_series = [float(h.get("failures", 0)) for h in history]
     response_series = [float(h.get("response_ms")) for h in history if h.get("response_ms")]
 
-    predicted_cpu = exponential_smoothing(cpu_series, AUTO_SCALE_SMOOTHING, 0.0) or 0.0
-    predicted_mem = exponential_smoothing(mem_series, AUTO_SCALE_SMOOTHING, 0.0) or 0.0
-    predicted_failures = exponential_smoothing(failure_series, AUTO_SCALE_SMOOTHING, 0.0) or 0.0
-    predicted_response = exponential_smoothing(response_series, AUTO_SCALE_SMOOTHING, 0.0)
+    cfg = autoscale_config()
+    smoothing = float(cfg.get("smoothing", AUTO_SCALE_SMOOTHING))
+    min_replicas = int(cfg.get("min_replicas", AUTO_SCALE_MIN_REPLICAS))
+    failure_weight = float(cfg.get("failure_weight", AUTO_SCALE_FAILURE_WEIGHT))
+
+    predicted_cpu = exponential_smoothing(cpu_series, smoothing, 0.0) or 0.0
+    predicted_mem = exponential_smoothing(mem_series, smoothing, 0.0) or 0.0
+    predicted_failures = exponential_smoothing(failure_series, smoothing, 0.0) or 0.0
+    predicted_response = exponential_smoothing(response_series, smoothing, 0.0)
 
     predicted_load = max(predicted_cpu, predicted_mem)
-    replicas = max(current_replicas or AUTO_SCALE_MIN_REPLICAS, AUTO_SCALE_MIN_REPLICAS)
+    replicas = max(current_replicas or min_replicas, min_replicas)
 
     if predicted_load > 75:
         replicas += 1
-    elif predicted_load < 25 and replicas > AUTO_SCALE_MIN_REPLICAS:
+    elif predicted_load < 25 and replicas > min_replicas:
         replicas -= 1
 
-    if predicted_failures * AUTO_SCALE_FAILURE_WEIGHT >= 1:
-        replicas = max(replicas, (current_replicas or AUTO_SCALE_MIN_REPLICAS) + 1)
+    if predicted_failures * failure_weight >= 1:
+        replicas = max(replicas, (current_replicas or min_replicas) + 1)
 
     details = {
         "service_id": service_id,
@@ -665,25 +759,31 @@ def release_controller_lock() -> None:
 
 def scaler_loop() -> None:
     while True:
-        if not AUTO_SCALE_ENABLED:
-            time.sleep(AUTO_SCALE_INTERVAL)
+        cfg = autoscale_config()
+        interval = max(1, int(cfg.get("interval_seconds", AUTO_SCALE_INTERVAL)))
+        if not cfg.get("enabled", True):
+            time.sleep(interval)
             continue
 
         try:
             services = summarize_services()
             host = host_metrics()
             store = record_service_metrics(services, host)
+            overrides = service_overrides()
             for svc in services:
                 svc_id = svc.get("id")
                 if not svc_id:
                     continue
 
                 bucket = store.get("services", {}).get(svc_id, {})
+                if overrides.get(svc_id, {}).get("autoscale_paused"):
+                    continue
+
                 if not bucket.get("auto_scale"):
                     continue
 
                 recommendation = forecast_replicas(svc_id, bucket, svc.get("replicas") or svc.get("desired"))
-                target = max(int(recommendation.get("recommended_replicas", 0)), AUTO_SCALE_MIN_REPLICAS)
+                target = max(int(recommendation.get("recommended_replicas", 0)), cfg.get("min_replicas", AUTO_SCALE_MIN_REPLICAS))
                 current = svc.get("replicas") or svc.get("desired") or 0
                 if target != current:
                     try:
@@ -694,7 +794,7 @@ def scaler_loop() -> None:
         except Exception as exc:  # noqa: BLE001
             record_scale_event("controller", None, "error", str(exc))
 
-        time.sleep(AUTO_SCALE_INTERVAL)
+        time.sleep(interval)
 
 
 def git_command(args: List[str]) -> CompletedProcess[str]:
@@ -829,8 +929,10 @@ def build_insights(host: Dict[str, Any], nodes: List[Dict[str, Any]], services: 
 
 def remediation_loop() -> None:
     while True:
-        if not AUTO_REMEDIATE_ENABLED:
-            time.sleep(AUTO_REMEDIATE_INTERVAL)
+        cfg = remediation_config()
+        interval = max(1, int(cfg.get("interval_seconds", AUTO_REMEDIATE_INTERVAL)))
+        if not cfg.get("enabled", False):
+            time.sleep(interval)
             continue
 
         try:
@@ -838,7 +940,7 @@ def remediation_loop() -> None:
         except Exception as exc:  # noqa: BLE001
             record_remediation_event("controller-error", "controller", "error", str(exc))
 
-        time.sleep(AUTO_REMEDIATE_INTERVAL)
+        time.sleep(interval)
 
 
 @app.route("/api/summary")
@@ -871,14 +973,15 @@ def summary() -> Any:
         "forecasts": forecasts,
         "remediation": {
             "config": remediation_config(),
-            "events": list(REMEDIATION_EVENTS)[:20],
+            "events": list(REMEDIATION_EVENTS)[:50],
+            "overrides": service_overrides(),
         },
         "autoscaler": {
-            "enabled": AUTO_SCALE_ENABLED,
-            "interval_seconds": AUTO_SCALE_INTERVAL,
+            **autoscale_config(),
             "last_metrics": metrics_store.get("last_updated"),
             "events": list(scale_events),
         },
+        "service_overrides": service_overrides(),
         "timestamp": dt.datetime.utcnow().isoformat() + "Z",
     }
     return jsonify(data)
@@ -902,9 +1005,75 @@ def admin() -> Any:
             "repo": repo_update_status(False),
             "forecasts": build_forecast_snapshot(services),
             "autoscaler_events": list(scale_events),
+            "settings": {
+                "remediation": remediation_config(),
+                "autoscale": autoscale_config(),
+                "overrides": service_overrides(),
+            },
+            "remediation_events": list(REMEDIATION_EVENTS),
             "llm": texture_llm_status(),
         }
     )
+
+
+@app.get("/api/admin/settings")
+def get_settings() -> Any:
+    return jsonify({"remediation": remediation_config(), "autoscale": autoscale_config(), "overrides": service_overrides()})
+
+
+@app.post("/api/admin/settings")
+def update_settings() -> Any:
+    payload = request.get_json(silent=True) or {}
+    rem_payload = payload.get("remediation", {}) if isinstance(payload.get("remediation"), dict) else {}
+    auto_payload = payload.get("autoscale", {}) if isinstance(payload.get("autoscale"), dict) else {}
+    override_payload = payload.get("overrides") or payload.get("service_overrides") or {}
+
+    def _coerce(value: Any, caster: Any, default: Any) -> Any:
+        try:
+            return caster(value)
+        except Exception:  # noqa: BLE001
+            return default
+
+    rem_cfg = remediation_config()
+    rem_keys = {
+        "enabled": bool,
+        "interval_seconds": int,
+        "max_service_restarts": int,
+        "cooldown_seconds": int,
+        "min_managers": int,
+        "event_buffer": int,
+    }
+    for key, caster in rem_keys.items():
+        if key in rem_payload:
+            rem_cfg[key] = _coerce(rem_payload.get(key), caster, rem_cfg.get(key))
+
+    auto_cfg = autoscale_config()
+    auto_keys = {
+        "enabled": bool,
+        "interval_seconds": int,
+        "smoothing": float,
+        "min_replicas": int,
+        "history_limit": int,
+        "failure_weight": float,
+    }
+    for key, caster in auto_keys.items():
+        if key in auto_payload:
+            auto_cfg[key] = _coerce(auto_payload.get(key), caster, auto_cfg.get(key))
+
+    overrides = service_overrides()
+    if isinstance(override_payload, dict):
+        for svc, svc_settings in override_payload.items():
+            if not isinstance(svc_settings, dict):
+                continue
+            current = overrides.get(svc, {})
+            if "remediation_paused" in svc_settings:
+                current["remediation_paused"] = bool(svc_settings.get("remediation_paused"))
+            if "autoscale_paused" in svc_settings:
+                current["autoscale_paused"] = bool(svc_settings.get("autoscale_paused"))
+            overrides[svc] = current
+
+    merged = persist_runtime_settings({"remediation": rem_cfg, "autoscale": auto_cfg, "service_overrides": overrides})
+    return jsonify({"settings": merged})
 
 
 @app.post("/api/admin/rotate-tokens")
@@ -1024,6 +1193,21 @@ def set_service_autoscale(service_id: str) -> Any:
     _persist_metrics_store(store)
 
     return jsonify({"service": service_id, "auto_scale": enabled})
+
+
+@app.post("/api/services/<service_id>/automation")
+def set_service_automation(service_id: str) -> Any:
+    payload = request.get_json(silent=True) or {}
+    overrides = service_overrides()
+    current = overrides.get(service_id, {})
+    if "remediation_paused" in payload:
+        current["remediation_paused"] = bool(payload.get("remediation_paused"))
+    if "autoscale_paused" in payload:
+        current["autoscale_paused"] = bool(payload.get("autoscale_paused"))
+    overrides[service_id] = current
+
+    merged = persist_runtime_settings({"service_overrides": overrides})
+    return jsonify({"service": service_id, "overrides": merged.get("service_overrides", {}).get(service_id, {})})
 
 
 @app.get("/api/admin/repo-status")
