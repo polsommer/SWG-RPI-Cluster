@@ -10,7 +10,7 @@ volumes:
 
 configs:
   metadata-analyzer-script:
-    file: ./stack/metadata_analyzer.py
+    file: ./metadata_analyzer.py
 
 services:
   redis-bus:
