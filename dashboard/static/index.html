@@ -64,6 +64,10 @@
     .insight.ok .dot { background: var(--success); }
     .insight.warn .dot { background: var(--danger); }
     .insight.info .dot { background: var(--accent); }
+    .event-log { list-style: none; padding-left: 0; margin: 0; display: grid; gap: 8px; }
+    .event-log li { border: 1px solid var(--card-border); padding: 10px; border-radius: 10px; background: rgba(255,255,255,0.03); }
+    .event-meta { display: flex; gap: 10px; flex-wrap: wrap; color: var(--muted); font-size: 0.9rem; }
+    .pill.neutral { background: rgba(255,255,255,0.08); color: var(--text); }
     @media (max-width: 720px) { header { flex-direction: column; align-items: flex-start; } }
   </style>
 </head>
@@ -105,6 +109,11 @@
       <h3>Smart Insights</h3>
       <div class="muted" style="margin-bottom: 8px;">Auto-curated health signals from host, nodes, and services.</div>
       <div class="stacked" id="insights"></div>
+    </div>
+    <div class="card" style="grid-column: 1 / -1;">
+      <h3>Auto-Remediation</h3>
+      <div class="muted" style="margin-bottom: 8px;">Background controller events and safety rails.</div>
+      <div class="stacked" id="remediation-card"></div>
     </div>
   </section>
 
@@ -255,6 +264,8 @@
           <td>${formatPorts(s.ports)}</td>
         </tr>`;
       }).join('');
+
+      renderRemediation(data.remediation);
     }
 
     function renderInsights(data) {
@@ -277,6 +288,37 @@
         <ul class="stacked" style="list-style: none; padding-left: 0; gap: 6px;">
           ${messages.map(msg => `<li class="insight ${msg.level}"><span class="dot"></span><span>${msg.text}</span></li>`).join('')}
         </ul>
+      `;
+    }
+
+    function renderRemediation(data) {
+      const root = document.getElementById('remediation-card');
+      if (!root) return;
+      if (!data) {
+        root.innerHTML = '<div class="muted">Controller not initialized.</div>';
+        return;
+      }
+
+      const cfg = data.config || {};
+      const events = data.events || [];
+      const status = cfg.enabled ? 'Enabled' : 'Disabled';
+      const limitInfo = `${cfg.max_service_restarts ?? '-'} restarts, ${cfg.cooldown_seconds ?? '-'}s cooldown`;
+      const intervalInfo = `${cfg.interval_seconds ?? '-'}s cadence • Manager floor: ${cfg.min_managers ?? '-'}`;
+      const list = events.length ? `<ul class="event-log">${events.map(e => `
+        <li>
+          <div class="event-meta"><strong>${e.action}</strong><span class="pill ${e.status === 'success' ? 'good' : e.status === 'skipped' ? 'neutral' : 'bad'}">${e.status}</span><span>${new Date(e.ts).toLocaleString()}</span></div>
+          <div class="muted">Target: ${e.target}</div>
+          <div>${e.message || ''}</div>
+        </li>`).join('')}</ul>` : '<div class="muted">No remediation actions taken yet.</div>';
+
+      root.innerHTML = `
+        <div class="toolbar" style="justify-content: space-between; flex-wrap: wrap;">
+          <div><strong>Status:</strong> ${status}</div>
+          <span class="pill ${cfg.enabled ? 'good' : 'bad'}">${status}</span>
+        </div>
+        <div class="muted">${limitInfo}</div>
+        <div class="muted">${intervalInfo}</div>
+        <div class="stacked">${list}</div>
       `;
     }
 
