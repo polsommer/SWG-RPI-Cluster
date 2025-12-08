@@ -60,12 +60,126 @@ services:
 
   esrgan-upscaler-gpu:
     image: ghcr.io/xinntao/real-esrgan:latest
+    command:
+      - /bin/sh
+      - -c
+      - |
+        pip install --no-cache-dir redis && \
+        python - <<'PY'
+        import json
+        import os
+        import pathlib
+        import subprocess
+        import time
+        import urllib.request
+
+        from redis import Redis
+
+        redis = Redis.from_url(os.environ.get("REDIS_URL", "redis://redis-bus:6379/0"), decode_responses=True)
+
+        input_channel = os.environ.get("INPUT_CHANNEL", "texture:ingest")
+        output_channel = os.environ.get("OUTPUT_CHANNEL", "texture:upscaled")
+        texture_root = pathlib.Path(os.environ.get("TEXTURE_PATH", "/srv/textures")).resolve()
+        output_root = pathlib.Path(os.environ.get("OUTPUT_PATH", texture_root / "output")).resolve()
+        model = os.environ.get("MODEL", "RealESRGAN_x4plus")
+        outscale = os.environ.get("OUTSCALE", "4")
+        suffix = os.environ.get("OUTPUT_SUFFIX", "upscaled")
+        extensions = {".png", ".jpg", ".jpeg", ".tga", ".bmp", ".dds"}
+
+        output_root.mkdir(parents=True, exist_ok=True)
+
+        def publish(payload):
+          redis.publish(output_channel, json.dumps(payload))
+
+        def list_targets(message: str):
+          if message.startswith(("http://", "https://")):
+            incoming_dir = texture_root / "incoming"
+            incoming_dir.mkdir(parents=True, exist_ok=True)
+            filename = incoming_dir / pathlib.Path(message.split("?")[0]).name
+            try:
+              urllib.request.urlretrieve(message, filename)
+              return [filename]
+            except Exception:
+              return []
+
+          parts = message.split()
+          target = " ".join(parts[1:]) if parts[:1] == ["scan"] else message
+          if not target:
+            return []
+          path = pathlib.Path(target).expanduser()
+          try:
+            path.resolve().relative_to(texture_root)
+          except Exception:
+            return []
+          if path.is_dir():
+            return [p for p in path.rglob("*") if p.suffix.lower() in extensions and p.is_file()]
+          if path.is_file() and path.suffix.lower() in extensions:
+            return [path]
+          return []
+
+        def expected_output(input_path: pathlib.Path):
+          rel = input_path.resolve().relative_to(texture_root)
+          dest_dir = (output_root / rel.parent).resolve()
+          dest_dir.mkdir(parents=True, exist_ok=True)
+          return dest_dir / f"{input_path.stem}_{suffix}{input_path.suffix}"
+
+        def run_inference(src: pathlib.Path, dest: pathlib.Path):
+          cmd = [
+            "python3",
+            "inference_realesrgan.py",
+            "-n",
+            model,
+            "-i",
+            str(src),
+            "-o",
+            str(dest),
+            "--outscale",
+            str(outscale),
+            "--suffix",
+            suffix,
+          ]
+          subprocess.run(cmd, check=True)
+
+        publish({"status": "online", "model": model, "scale": outscale, "output_root": str(output_root)})
+        pubsub = redis.pubsub()
+        pubsub.subscribe(input_channel)
+
+        for msg in pubsub.listen():
+          if msg.get("type") != "message":
+            continue
+          body = msg.get("data") or ""
+          targets = list_targets(body)
+          if not targets:
+            publish({"status": "ignored", "reason": "no-targets", "message": body})
+            continue
+          for src in targets:
+            dest = expected_output(src)
+            if dest.exists() and dest.stat().st_mtime >= src.stat().st_mtime:
+              publish({"status": "skipped", "input": str(src), "output": str(dest), "reason": "up-to-date"})
+              continue
+            started = time.time()
+            try:
+              run_inference(src, dest)
+              publish({
+                "status": "completed",
+                "input": str(src),
+                "output": str(dest),
+                "model": model,
+                "scale": outscale,
+                "duration_sec": round(time.time() - started, 2),
+              })
+            except Exception as exc:  # noqa: BLE001
+              publish({"status": "error", "input": str(src), "error": str(exc)})
+        PY
     environment:
       - REDIS_URL=redis://redis-bus:6379/0
       - INPUT_CHANNEL=texture:ingest
       - OUTPUT_CHANNEL=texture:upscaled
       - TEXTURE_PATH=/srv/textures
+      - OUTPUT_PATH=/srv/textures/output
       - MODEL=RealESRGAN_x4plus
+      - OUTSCALE=4
+      - OUTPUT_SUFFIX=upscaled
     volumes:
       - textures-share:/srv/textures
     networks:
