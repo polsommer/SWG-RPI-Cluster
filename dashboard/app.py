@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import atexit
 import base64
 import datetime as dt
 import json
@@ -8,6 +9,7 @@ import shutil
 import socket
 import threading
 import time
+import fcntl
 from collections import deque
 from pathlib import Path
 from typing import Any, Dict, List, Tuple
@@ -16,14 +18,26 @@ import docker
 import psutil
 from flask import Flask, jsonify, request, send_from_directory
 from subprocess import CalledProcessError, CompletedProcess, run
+from docker.errors import DockerException
 
 app = Flask(__name__, static_folder="static", static_url_path="")
-client = docker.from_env()
+try:
+    client = docker.from_env()
+except DockerException as exc:  # pragma: no cover - exercised in tests
+    app.logger.warning("Docker client unavailable: %s", exc)
+
+    class _UnavailableDockerClient:
+        def __getattr__(self, name: str) -> Any:
+            raise RuntimeError(f"Docker client unavailable: {exc}") from exc
+
+    client = _UnavailableDockerClient()
 REPO_ROOT = Path(__file__).resolve().parents[1]
 METRICS_STORE = Path(os.environ.get("METRICS_STORE", "/tmp/service_metrics.json"))
 METRICS_LOCK = threading.Lock()
 AUTH_TOKEN = os.environ.get("DASHBOARD_AUTH_TOKEN", "").strip()
 PROTECTED_PATH_PREFIXES = ("/api/admin", "/api/nodes", "/api/services")
+CONTROLLER_LOCK_FILE = Path(os.environ.get("DASHBOARD_CONTROLLER_LOCK", "/tmp/dashboard_controller.lock"))
+controller_lock_handle = None
 
 
 def _bool_env(name: str, default: bool = False) -> bool:
@@ -109,6 +123,7 @@ remediation_lock = threading.Lock()
 remediation_thread_started = False
 scaler_thread_started = False
 scale_events: deque[Dict[str, Any]] = deque(maxlen=100)
+controller_lock = threading.Lock()
 
 
 def format_duration(seconds: float) -> str:
@@ -580,6 +595,57 @@ def update_service_replicas(service_id: str, replicas: int) -> None:
     service.update(mode={"Replicated": {"Replicas": replicas}}, fetch_current_spec=True)
 
 
+def is_swarm_manager() -> bool:
+    try:
+        info = client.info()
+    except Exception as exc:  # noqa: BLE001
+        app.logger.warning("Unable to determine swarm manager status: %s", exc)
+        return False
+
+    swarm = info.get("Swarm", {})
+    is_manager = swarm.get("ControlAvailable") and swarm.get("LocalNodeState") == "active"
+    if not is_manager:
+        app.logger.info(
+            "Skipping controller startup: state=%s, control_available=%s",
+            swarm.get("LocalNodeState"),
+            swarm.get("ControlAvailable"),
+        )
+    return bool(is_manager)
+
+
+def acquire_controller_lock() -> bool:
+    global controller_lock_handle
+    with controller_lock:
+        if controller_lock_handle:
+            return True
+
+        try:
+            CONTROLLER_LOCK_FILE.parent.mkdir(parents=True, exist_ok=True)
+            handle = CONTROLLER_LOCK_FILE.open("a+")
+            fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError as exc:
+            app.logger.info("Controller lock unavailable (%s): %s", CONTROLLER_LOCK_FILE, exc)
+            return False
+
+        controller_lock_handle = handle
+        app.logger.info("Acquired controller lock at %s", CONTROLLER_LOCK_FILE)
+        return True
+
+
+def release_controller_lock() -> None:
+    global controller_lock_handle
+    with controller_lock:
+        if not controller_lock_handle:
+            return
+
+        try:
+            fcntl.flock(controller_lock_handle, fcntl.LOCK_UN)
+        finally:
+            controller_lock_handle.close()
+            controller_lock_handle = None
+            app.logger.info("Released controller lock at %s", CONTROLLER_LOCK_FILE)
+
+
 def scaler_loop() -> None:
     while True:
         if not AUTO_SCALE_ENABLED:
@@ -964,6 +1030,7 @@ def ensure_remediation_thread() -> None:
     global remediation_thread_started
     if remediation_thread_started:
         return
+    app.logger.info("Starting auto-remediation controller thread")
     remediation_thread = threading.Thread(target=remediation_loop, daemon=True)
     remediation_thread.start()
     remediation_thread_started = True
@@ -973,14 +1040,34 @@ def ensure_scaler_thread() -> None:
     global scaler_thread_started
     if scaler_thread_started:
         return
+    app.logger.info("Starting autoscaler controller thread")
     scaler_thread = threading.Thread(target=scaler_loop, daemon=True)
     scaler_thread.start()
     scaler_thread_started = True
 
 
-ensure_remediation_thread()
-ensure_scaler_thread()
+def start_controllers_if_eligible() -> bool:
+    if not is_swarm_manager():
+        return False
+
+    if not acquire_controller_lock():
+        return False
+
+    ensure_remediation_thread()
+    ensure_scaler_thread()
+    app.logger.info("Controller threads started on swarm manager node")
+    return True
+
+
+def create_app(start_controllers: bool = False) -> Flask:
+    if start_controllers:
+        start_controllers_if_eligible()
+    return app
+
+
+atexit.register(release_controller_lock)
 
 
 if __name__ == "__main__":
+    create_app(start_controllers=True)
     app.run(host="0.0.0.0", port=8081)
