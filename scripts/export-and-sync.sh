@@ -132,7 +132,10 @@ polling_loop() {
 }
 
 main() {
-  [[ -d "$WATCH_DIR" ]] || fail "WATCH_DIR $WATCH_DIR does not exist"
+  if [[ ! -d "$WATCH_DIR" ]]; then
+    log "WARN" "WATCH_DIR $WATCH_DIR does not exist; creating it"
+    mkdir -p "$WATCH_DIR"
+  fi
 
   # Run an initial sync immediately.
   run_sync_cycle
