@@ -58,6 +58,7 @@
     .pill.bad { background: rgba(248,113,113,0.12); color: var(--danger); }
     .inline-input { display: flex; gap: 8px; align-items: center; }
     input[type="number"] { width: 90px; padding: 8px; border-radius: 10px; border: 1px solid var(--card-border); background: rgba(0,0,0,0.25); color: var(--text); }
+    .token-input { width: 240px; padding: 10px; border-radius: 10px; border: 1px solid var(--card-border); background: rgba(0,0,0,0.25); color: var(--text); }
     ul { margin: 0; padding-left: 18px; }
     .insight { display: flex; align-items: center; gap: 8px; }
     .insight .dot { width: 10px; height: 10px; border-radius: 50%; }
@@ -85,6 +86,13 @@
       <button class="btn ghost" onclick="scrollToSection('ssh-console')">SSH</button>
       <div id="timestamp" class="pill">Loading...</div>
       <div id="admin-status" class="pill good" style="display:none;"></div>
+    </div>
+    <div class="toolbar" id="auth-controls" style="flex-wrap: wrap;">
+      <input id="auth-token-input" class="token-input" type="password" placeholder="Access token" aria-label="Dashboard access token" />
+      <label class="muted" style="display:flex; align-items:center; gap:6px;"><input type="checkbox" id="remember-token" /> Remember on this device</label>
+      <button class="btn" onclick="saveAuthToken()">Save token</button>
+      <button class="btn ghost" onclick="clearAuthToken()">Clear</button>
+      <div id="auth-pill" class="pill neutral" style="display:none;">Auth required</div>
     </div>
   </header>
 
@@ -189,7 +197,88 @@
   <script>
     const $ = (sel) => document.querySelector(sel);
     const REFRESH_MS = 5000;
+    const TOKEN_KEY = 'swarmAuthToken';
     let nodesCache = [];
+
+    function getStoredToken() {
+      return sessionStorage.getItem(TOKEN_KEY) || localStorage.getItem(TOKEN_KEY) || '';
+    }
+
+    function persistToken(token, remember) {
+      if (remember) {
+        localStorage.setItem(TOKEN_KEY, token);
+        sessionStorage.removeItem(TOKEN_KEY);
+      } else {
+        sessionStorage.setItem(TOKEN_KEY, token);
+        localStorage.removeItem(TOKEN_KEY);
+      }
+    }
+
+    function updateAuthIndicator(token = null, error = false) {
+      const pill = document.getElementById('auth-pill');
+      if (!pill) return;
+      const current = token ?? getStoredToken();
+      if (!current) {
+        pill.textContent = 'Auth required';
+        pill.className = 'pill bad';
+        pill.style.display = 'inline-flex';
+        return;
+      }
+      pill.textContent = error ? 'Invalid token' : 'Authenticated';
+      pill.className = `pill ${error ? 'bad' : 'good'}`;
+      pill.style.display = 'inline-flex';
+    }
+
+    function saveAuthToken() {
+      const input = document.getElementById('auth-token-input');
+      const remember = document.getElementById('remember-token')?.checked;
+      const token = input?.value.trim();
+      if (!token) {
+        setStatus('Enter a token first', false);
+        return;
+      }
+      persistToken(token, remember);
+      updateAuthIndicator(token);
+      setStatus('Access token saved', true);
+    }
+
+    function clearAuthToken() {
+      sessionStorage.removeItem(TOKEN_KEY);
+      localStorage.removeItem(TOKEN_KEY);
+      const input = document.getElementById('auth-token-input');
+      if (input) input.value = '';
+      updateAuthIndicator('');
+      setStatus('Access token cleared', true);
+    }
+
+    function requireAuthToken(promptUser = false) {
+      let token = getStoredToken();
+      if (!token && promptUser) {
+        const provided = prompt('Enter dashboard access token');
+        if (provided) {
+          const remember = document.getElementById('remember-token')?.checked;
+          persistToken(provided.trim(), remember);
+          token = provided.trim();
+        }
+      }
+      updateAuthIndicator(token);
+      return token;
+    }
+
+    async function authedFetch(url, options = {}) {
+      const token = requireAuthToken(true);
+      if (!token) {
+        throw new Error('Authentication required');
+      }
+      const headers = new Headers(options.headers || {});
+      headers.set('Authorization', `Bearer ${token}`);
+      const res = await fetch(url, { ...options, headers });
+      if (res.status === 401) {
+        updateAuthIndicator(null, true);
+        throw new Error('Unauthorized');
+      }
+      return res;
+    }
 
     function badge(text, ok = true) {
       return `<span class="tag ${ok ? 'ok' : 'warn'}">${text}</span>`;
@@ -382,7 +471,7 @@
 
     async function rotateTokens() {
       try {
-        const res = await fetch('/api/admin/rotate-tokens', { method: 'POST' });
+        const res = await authedFetch('/api/admin/rotate-tokens', { method: 'POST' });
         if (!res.ok) throw new Error('Failed to rotate tokens');
         await refreshAdmin();
         setStatus('Join tokens rotated', true);
@@ -394,7 +483,7 @@
 
     async function setAvailability(nodeId, state) {
       try {
-        const res = await fetch(`/api/nodes/${nodeId}/availability`, {
+        const res = await authedFetch(`/api/nodes/${nodeId}/availability`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ availability: state })
@@ -411,7 +500,7 @@
 
     async function setRole(nodeId, role) {
       try {
-        const res = await fetch(`/api/nodes/${nodeId}/role`, {
+        const res = await authedFetch(`/api/nodes/${nodeId}/role`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ role })
@@ -440,7 +529,7 @@
       if (!textarea) return;
       const labels = parseLabels(textarea.value || '');
       try {
-        const res = await fetch(`/api/nodes/${nodeId}/labels`, {
+        const res = await authedFetch(`/api/nodes/${nodeId}/labels`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ labels })
@@ -493,7 +582,7 @@
 
       setSshOutput('Running...');
       try {
-        const res = await fetch('/api/admin/ssh-run', {
+        const res = await authedFetch('/api/admin/ssh-run', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ host, command })
@@ -524,7 +613,7 @@
       const field = document.getElementById(inputId);
       const replicas = field ? field.value : 1;
       try {
-        const res = await fetch(`/api/services/${serviceId}/scale`, {
+        const res = await authedFetch(`/api/services/${serviceId}/scale`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ replicas })
@@ -541,7 +630,7 @@
 
     async function toggleAutoScale(serviceId, enabled) {
       try {
-        const res = await fetch(`/api/services/${serviceId}/autoscale`, {
+        const res = await authedFetch(`/api/services/${serviceId}/autoscale`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ enabled })
@@ -681,7 +770,7 @@
 
     async function checkRepoStatus() {
       try {
-        const res = await fetch('/api/admin/repo-status');
+        const res = await authedFetch('/api/admin/repo-status');
         if (!res.ok) throw new Error('unable to check repo');
         const repo = await res.json();
         if (repo.error) {
@@ -698,7 +787,7 @@
 
     async function applyUpdates() {
       try {
-        const res = await fetch('/api/admin/update', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ apply: true }) });
+        const res = await authedFetch('/api/admin/update', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ apply: true }) });
         const repo = await res.json();
         if (!res.ok || repo.error) {
           throw new Error(repo.error || 'Update failed');
@@ -713,26 +802,41 @@
 
     async function refresh() {
       try {
-        const res = await fetch('/api/summary');
+        const token = requireAuthToken(true);
+        if (!token) {
+          $('#timestamp').textContent = 'Auth required';
+          return;
+        }
+        const res = await authedFetch('/api/summary');
         const data = await res.json();
         renderSummary(data);
         renderInsights(data.insights);
       } catch (err) {
-        $('#timestamp').textContent = 'Connection lost';
+        const msg = (err?.message || '').toLowerCase().includes('auth') ? 'Auth required' : 'Connection lost';
+        $('#timestamp').textContent = msg;
+        if (msg === 'Auth required') {
+          setStatus('Provide dashboard token to continue', false);
+        }
         console.error(err);
       }
     }
 
     async function refreshAdmin() {
       try {
-        const res = await fetch('/api/admin');
+        const token = requireAuthToken(true);
+        if (!token) return;
+        const res = await authedFetch('/api/admin');
         const data = await res.json();
         renderAdmin(data);
       } catch (err) {
         console.error(err);
+        if ((err?.message || '').toLowerCase().includes('auth')) {
+          setStatus('Authentication required for admin calls', false);
+        }
       }
     }
 
+    updateAuthIndicator();
     refresh();
     refreshAdmin();
     setInterval(refresh, REFRESH_MS);
