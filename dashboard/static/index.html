@@ -98,6 +98,10 @@
       <div class="stacked" id="cluster-metrics-card"></div>
     </div>
     <div class="card">
+      <h3>Forecast &amp; Autoscaler</h3>
+      <div class="stacked" id="forecast-card"></div>
+    </div>
+    <div class="card">
       <h3>Redis Mesh Check</h3>
       <div id="redis-card" class="stacked muted"></div>
     </div>
@@ -124,7 +128,7 @@
       <h3>Services</h3>
       <div class="muted" style="margin-bottom: 8px;">Replicas, images, and exposed ports</div>
       <table id="services-table">
-        <thead><tr><th>Name</th><th>Image</th><th>Mode</th><th>Replicas</th><th>Ports</th></tr></thead>
+        <thead><tr><th>Name</th><th>Image</th><th>Mode</th><th>Replicas</th><th>Ports</th><th>Predicted</th><th>Autoscale</th></tr></thead>
         <tbody></tbody>
       </table>
     </div>
@@ -176,6 +180,9 @@
     const $ = (sel) => document.querySelector(sel);
     const REFRESH_MS = 5000;
     let nodesCache = [];
+    let forecastCache = {};
+    let autoscalerActions = [];
+    let hostForecastCache = {};
 
     function badge(text, ok = true) {
       return `<span class="tag ${ok ? 'ok' : 'warn'}">${text}</span>`;
@@ -194,6 +201,10 @@
 
     function renderSummary(data) {
       $('#timestamp').textContent = `Updated ${new Date(data.timestamp).toLocaleTimeString()}`;
+      forecastCache = {};
+      (data.forecasts || []).forEach(f => { forecastCache[f.service_id] = f; });
+      autoscalerActions = (data.autoscaler?.actions) || [];
+      hostForecastCache = data.host_forecast || {};
 
       const c = data.cluster;
       $('#cluster-card').innerHTML = `
@@ -223,6 +234,17 @@
         <div class="muted">Drained nodes: ${m.drained_nodes ?? 0}</div>
       `;
 
+      const hf = hostForecastCache || {};
+      const actionList = autoscalerActions.length
+        ? `<ul style="margin:0; padding-left: 18px;">${autoscalerActions.map(a => `<li>${a.service || a.service_id}: ${a.applied_replicas ? `set to ${a.applied_replicas}` : a.error}</li>`).join('')}</ul>`
+        : '<div class="muted">No auto-scale events yet.</div>';
+      $('#forecast-card').innerHTML = `
+        <div><strong>Host forecast</strong></div>
+        <div class="muted">CPU: ${hf.cpu_percent ? hf.cpu_percent.toFixed(1) + '%' : 'n/a'} • Memory: ${hf.mem_percent ? hf.mem_percent.toFixed(1) + '%' : 'n/a'}</div>
+        <div><strong>Recent scaler actions</strong></div>
+        ${actionList}
+      `;
+
       const r = data.redis_ping;
       $('#redis-card').innerHTML = `
         <div><strong>Target:</strong> ${r.redis}</div>
@@ -247,12 +269,18 @@
       const services = data.services || [];
       $('#services-table tbody').innerHTML = services.map(s => {
         const ok = s.running === s.desired;
+        const fc = forecastCache[s.id] || {};
+        const predicted = fc.predicted_running ? fc.predicted_running.toFixed(1) : '-';
+        const recommended = fc.recommended_replicas ?? '-';
+        const autoEnabled = (fc.auto_scale || {}).enabled;
         return `<tr>
           <td><strong>${s.name}</strong><div class="muted">${s.id}</div></td>
           <td>${s.image}</td>
           <td>${s.mode}</td>
           <td>${badge(`${s.running}/${s.desired}`, ok)}</td>
           <td>${formatPorts(s.ports)}</td>
+          <td>${predicted} / ${recommended}</td>
+          <td>${badge(autoEnabled ? 'Auto' : 'Manual', !!autoEnabled)}</td>
         </tr>`;
       }).join('');
     }
@@ -453,6 +481,36 @@
       }
     }
 
+    async function saveAutoScale(serviceId, prefix) {
+      const enabled = document.getElementById(`${prefix}-enabled`)?.checked;
+      const min = document.getElementById(`${prefix}-min`)?.value || 1;
+      const max = document.getElementById(`${prefix}-max`)?.value || min;
+      const targetRt = document.getElementById(`${prefix}-rt`)?.value || 500;
+      const targetCpu = document.getElementById(`${prefix}-cpu`)?.value || 75;
+      const cooldown = document.getElementById(`${prefix}-cooldown`)?.value || 90;
+      try {
+        const res = await fetch(`/api/services/${serviceId}/auto-scale`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            enabled,
+            min_replicas: parseInt(min, 10),
+            max_replicas: parseInt(max, 10),
+            target_response_ms: parseInt(targetRt, 10),
+            target_cpu_percent: parseInt(targetCpu, 10),
+            cooldown_seconds: parseInt(cooldown, 10),
+          })
+        });
+        if (!res.ok) throw new Error('Unable to save policy');
+        setStatus(`Updated auto-scale for ${serviceId}`, true);
+        await refresh();
+        await refreshAdmin();
+      } catch (err) {
+        console.error(err);
+        setStatus(err.message || 'Failed to save auto-scale', false);
+      }
+    }
+
     function renderAdmin(data) {
       const tokens = data.tokens || {};
       const advertise = data.advertise_addr || 'manager:2377';
@@ -461,6 +519,7 @@
 
       const nodes = data.nodes || [];
       const services = (data.services || []).filter(s => s.mode === 'replicated');
+      const forecastMap = (data.forecasts || []).reduce((acc, f) => { acc[f.service_id] = f; return acc; }, {});
       const repo = data.repo || {};
 
       const repoStatus = repo.error ? `<span class="muted">${repo.error}</span>` : `
@@ -536,18 +595,53 @@
           <div class="stacked">
             ${services.length ? services.map((s, idx) => {
               const inputId = `scale-${idx}`;
+              const prefix = `auto-${idx}`;
               const current = s.replicas ?? s.desired ?? 1;
+              const fc = forecastMap[s.id] || {};
+              const auto = fc.auto_scale || {};
+              const recommended = fc.recommended_replicas ?? '-';
+              const predicted = fc.predicted_running ? fc.predicted_running.toFixed(1) : '-';
               return `
-                <div class="control-row">
-                  <div style="flex:1;">
-                    <strong>${s.name}</strong>
-                    <div class="muted">${s.image}</div>
-                    <div class="muted">Current: ${s.running}/${s.desired}</div>
+                <div class="control-row" style="flex-direction: column; gap: 10px;">
+                  <div style="display:flex; gap: 12px; flex-wrap: wrap; align-items: center;">
+                    <div style="flex:1;">
+                      <strong>${s.name}</strong>
+                      <div class="muted">${s.image}</div>
+                      <div class="muted">Current: ${s.running}/${s.desired}</div>
+                      <div class="muted">Predicted: ${predicted} • Recommended: ${recommended}</div>
+                    </div>
+                    <div class="inline-input">
+                      <label for="${inputId}" class="muted">Manual replicas</label>
+                      <input id="${inputId}" type="number" min="0" value="${current}" />
+                      <button class="btn" onclick="scaleService('${s.id}', '${inputId}')">Apply</button>
+                    </div>
                   </div>
-                  <div class="inline-input">
-                    <label for="${inputId}" class="muted">Replicas</label>
-                    <input id="${inputId}" type="number" min="0" value="${current}" />
-                    <button class="btn" onclick="scaleService('${s.id}', '${inputId}')">Apply</button>
+                  <div class="toolbar" style="flex-wrap: wrap; gap: 10px; align-items: center;">
+                    <div class="inline-input">
+                      <input id="${prefix}-enabled" type="checkbox" ${auto.enabled ? 'checked' : ''} />
+                      <span class="muted">Enable auto-scale</span>
+                    </div>
+                    <div class="inline-input">
+                      <label for="${prefix}-min" class="muted">Min</label>
+                      <input id="${prefix}-min" type="number" min="1" value="${auto.min_replicas ?? current}" />
+                    </div>
+                    <div class="inline-input">
+                      <label for="${prefix}-max" class="muted">Max</label>
+                      <input id="${prefix}-max" type="number" min="1" value="${auto.max_replicas ?? current}" />
+                    </div>
+                    <div class="inline-input">
+                      <label for="${prefix}-rt" class="muted">Target RT (ms)</label>
+                      <input id="${prefix}-rt" type="number" min="1" value="${auto.target_response_ms ?? 500}" />
+                    </div>
+                    <div class="inline-input">
+                      <label for="${prefix}-cpu" class="muted">Target CPU %</label>
+                      <input id="${prefix}-cpu" type="number" min="1" max="100" value="${auto.target_cpu_percent ?? 75}" />
+                    </div>
+                    <div class="inline-input">
+                      <label for="${prefix}-cooldown" class="muted">Cooldown (s)</label>
+                      <input id="${prefix}-cooldown" type="number" min="15" value="${auto.cooldown_seconds ?? 90}" />
+                    </div>
+                    <button class="btn" onclick="saveAutoScale('${s.id}', '${prefix}')">Save policy</button>
                   </div>
                 </div>
               `;

@@ -6,16 +6,19 @@ import shutil
 import socket
 import time
 from pathlib import Path
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import docker
 import psutil
 from flask import Flask, jsonify, request, send_from_directory
 from subprocess import CalledProcessError, CompletedProcess, run
 
+from metrics import MetricsStore
+
 app = Flask(__name__, static_folder="static", static_url_path="")
 client = docker.from_env()
 REPO_ROOT = Path(__file__).resolve().parents[1]
+METRICS_STORE = MetricsStore(Path(__file__).parent / "data" / "metrics.json")
 
 
 def format_duration(seconds: float) -> str:
@@ -72,6 +75,17 @@ def node_health_state(node: Dict[str, Any]) -> str:
     if node.get("state") not in {"ready", "active"}:
         return "degraded"
     return "healthy"
+
+
+def parse_timestamp(value: Optional[str]) -> Optional[dt.datetime]:
+    if not value:
+        return None
+    try:
+        if value.endswith("Z"):
+            value = value[:-1]
+        return dt.datetime.fromisoformat(value)
+    except ValueError:
+        return None
 
 
 def summarize_node_health(nodes: List[Dict[str, Any]]) -> Dict[str, Any]:
@@ -142,6 +156,48 @@ def evaluate_service_health(services: List[Dict[str, Any]]) -> Dict[str, Any]:
         "unstable": unstable,
         "healthy": len(services) - len(unhealthy_ids),
     }
+
+
+def build_service_forecasts(services: List[Dict[str, Any]], host_forecast: Dict[str, Any]) -> List[Dict[str, Any]]:
+    forecasts: List[Dict[str, Any]] = []
+    for svc in services:
+        forecast = METRICS_STORE.service_forecast(svc.get("id")) or {}
+        forecast.update({
+            "service_id": svc.get("id"),
+            "name": svc.get("name"),
+            "recommended_replicas": METRICS_STORE.recommended_replicas(svc, host_forecast),
+        })
+        forecasts.append(forecast)
+    return forecasts
+
+
+def apply_autoscaling(services: List[Dict[str, Any]], host_forecast: Dict[str, Any]) -> List[Dict[str, Any]]:
+    actions: List[Dict[str, Any]] = []
+    now = dt.datetime.utcnow()
+    for svc in services:
+        recommended = METRICS_STORE.recommended_replicas(svc, host_forecast)
+        if recommended is None:
+            continue
+
+        service_forecast = METRICS_STORE.service_forecast(svc.get("id")) or {}
+        auto_cfg = service_forecast.get("auto_scale", {})
+        last_scaled = parse_timestamp(auto_cfg.get("last_scaled_at"))
+        cooldown = int(auto_cfg.get("cooldown_seconds") or 90)
+        if last_scaled and (now - last_scaled).total_seconds() < cooldown:
+            continue
+
+        try:
+            swarm_service = client.services.get(svc.get("id"))
+            swarm_service.scale(recommended)
+            METRICS_STORE.set_last_scaled(svc.get("id"), now.isoformat() + "Z")
+            actions.append({
+                "service": svc.get("name"),
+                "service_id": svc.get("id"),
+                "applied_replicas": recommended,
+            })
+        except Exception as exc:  # noqa: BLE001
+            actions.append({"service": svc.get("name"), "service_id": svc.get("id"), "error": str(exc)})
+    return actions
 
 
 def worker_echo_rates() -> Dict[str, Any]:
@@ -350,6 +406,10 @@ def summary() -> Any:
     nodes = collect_nodes()
     services = summarize_services()
     host = host_metrics()
+    METRICS_STORE.record_snapshot(host, services)
+    host_forecast = METRICS_STORE.host_forecast()
+    forecasts = build_service_forecasts(services, host_forecast)
+    autoscaler_actions = apply_autoscaling(services, host_forecast)
     metrics = cluster_metrics(swarm, nodes, services)
     insights = build_insights(host, nodes, services)
     data = {
@@ -363,8 +423,11 @@ def summary() -> Any:
         },
         "cluster_metrics": metrics,
         "host": host,
+        "host_forecast": host_forecast,
         "nodes": nodes,
         "services": services,
+        "forecasts": forecasts,
+        "autoscaler": {"actions": autoscaler_actions},
         "insights": insights,
         "redis_ping": worker_echo_rates(),
         "timestamp": dt.datetime.utcnow().isoformat() + "Z",
@@ -378,13 +441,19 @@ def admin() -> Any:
     join_tokens = swarm.get("JoinTokens", {})
     managers = client.info().get("Swarm", {}).get("RemoteManagers", [])
     advertise_addr = managers[0].get("Addr") if managers else None
+    services = summarize_services()
+    host = host_metrics()
+    METRICS_STORE.record_snapshot(host, services)
+    host_forecast = METRICS_STORE.host_forecast()
 
     return jsonify(
         {
             "tokens": join_tokens,
             "advertise_addr": advertise_addr,
             "nodes": collect_nodes(),
-            "services": summarize_services(),
+            "services": services,
+            "host_forecast": host_forecast,
+            "forecasts": build_service_forecasts(services, host_forecast),
             "cluster": swarm,
             "repo": repo_update_status(False),
         }
@@ -476,6 +545,36 @@ def scale_service(service_id: str) -> Any:
         return jsonify({"ok": True, "service": service_id, "replicas": replicas_int})
     except Exception as exc:  # noqa: BLE001
         return jsonify({"error": str(exc)}), 500
+
+
+@app.post("/api/services/<service_id>/metrics")
+def record_service_metrics(service_id: str) -> Any:
+    payload = request.get_json(silent=True) or {}
+    if "response_time_ms" not in payload:
+        return jsonify({"error": "response_time_ms is required"}), 400
+    try:
+        METRICS_STORE.record_response_time(service_id, float(payload.get("response_time_ms")))
+        return jsonify({"ok": True})
+    except Exception as exc:  # noqa: BLE001
+        return jsonify({"error": str(exc)}), 400
+
+
+@app.post("/api/services/<service_id>/auto-scale")
+def configure_auto_scale(service_id: str) -> Any:
+    payload = request.get_json(silent=True) or {}
+    try:
+        config = METRICS_STORE.update_auto_scale(service_id, payload)
+        return jsonify({"service": service_id, "auto_scale": config})
+    except Exception as exc:  # noqa: BLE001
+        return jsonify({"error": str(exc)}), 400
+
+
+@app.get("/api/services/<service_id>/forecast")
+def get_service_forecast(service_id: str) -> Any:
+    forecast = METRICS_STORE.service_forecast(service_id)
+    if not forecast:
+        return jsonify({"error": "service not tracked"}), 404
+    return jsonify(forecast)
 
 
 @app.get("/api/admin/repo-status")
