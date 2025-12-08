@@ -1,0 +1,160 @@
+version: "3.9"
+
+networks:
+  cluster_net:
+    external: true
+
+volumes:
+  textures-share:
+  redis-data:
+
+services:
+  redis-bus:
+    image: redis:7-alpine
+    command: ["redis-server", "--appendonly", "yes"]
+    volumes:
+      - redis-data:/data
+    networks:
+      - cluster_net
+    deploy:
+      placement:
+        constraints:
+          - node.role == manager
+
+  texture-ingestion:
+    image: python:3.11-slim
+    command:
+      - /bin/sh
+    args:
+      - -c
+      - |
+        pip install --no-cache-dir redis watchdog && \
+        python - <<'PY'
+        import os
+        import time
+        from redis import Redis
+        redis = Redis.from_url(os.environ.get("REDIS_URL", "redis://redis-bus:6379/0"))
+        channel = os.environ.get("INGEST_CHANNEL", "texture:ingest")
+        path = os.environ.get("TEXTURE_PATH", "/srv/textures/incoming")
+        os.makedirs(path, exist_ok=True)
+        while True:
+            redis.publish(channel, f"scan {path}")
+            time.sleep(10)
+        PY
+    environment:
+      - REDIS_URL=redis://redis-bus:6379/0
+      - INGEST_CHANNEL=texture:ingest
+      - TEXTURE_PATH=/srv/textures/incoming
+      - OUTPUT_PATH=/srv/textures/processed
+    volumes:
+      - textures-share:/srv/textures
+    networks:
+      - cluster_net
+    depends_on:
+      - redis-bus
+    deploy:
+      replicas: 2
+      placement:
+        max_replicas_per_node: 1
+        constraints:
+          - node.role == worker
+
+  esrgan-upscaler-gpu:
+    image: ghcr.io/xinntao/real-esrgan:latest
+    environment:
+      - REDIS_URL=redis://redis-bus:6379/0
+      - INPUT_CHANNEL=texture:ingest
+      - OUTPUT_CHANNEL=texture:upscaled
+      - TEXTURE_PATH=/srv/textures
+      - MODEL=RealESRGAN_x4plus
+    volumes:
+      - textures-share:/srv/textures
+    networks:
+      - cluster_net
+    deploy:
+      replicas: 2
+      placement:
+        max_replicas_per_node: 1
+        constraints:
+          - node.role == worker
+          - node.labels.gpu == true
+    depends_on:
+      - redis-bus
+
+  esrgan-upscaler-cpu:
+    image: python:3.11-slim
+    command:
+      - /bin/sh
+    args:
+      - -c
+      - |
+        pip install --no-cache-dir realesrgan redis pillow && \
+        python - <<'PY'
+        import os
+        import time
+        from redis import Redis
+        redis = Redis.from_url(os.environ.get("REDIS_URL", "redis://redis-bus:6379/0"))
+        input_channel = os.environ.get("INPUT_CHANNEL", "texture:ingest")
+        output_channel = os.environ.get("OUTPUT_CHANNEL", "texture:upscaled")
+        path = os.environ.get("TEXTURE_PATH", "/srv/textures")
+        redis.publish(output_channel, f"cpu-upscaler-online using {path}")
+        while True:
+            redis.publish(output_channel, "cpu-upscaler-heartbeat")
+            time.sleep(30)
+        PY
+    environment:
+      - REDIS_URL=redis://redis-bus:6379/0
+      - INPUT_CHANNEL=texture:ingest
+      - OUTPUT_CHANNEL=texture:upscaled
+      - TEXTURE_PATH=/srv/textures
+    volumes:
+      - textures-share:/srv/textures
+    networks:
+      - cluster_net
+    depends_on:
+      - redis-bus
+    deploy:
+      replicas: 2
+      placement:
+        max_replicas_per_node: 1
+        constraints:
+          - node.role == worker
+          - node.labels.gpu != true
+
+  metadata-analyzer:
+    image: python:3.11-slim
+    command:
+      - /bin/sh
+    args:
+      - -c
+      - |
+        pip install --no-cache-dir redis && \
+        python - <<'PY'
+        import os
+        import time
+        from redis import Redis
+        redis = Redis.from_url(os.environ.get("REDIS_URL", "redis://redis-bus:6379/0"))
+        input_channel = os.environ.get("INPUT_CHANNEL", "texture:upscaled")
+        output_channel = os.environ.get("OUTPUT_CHANNEL", "texture:metadata")
+        redis.publish(output_channel, "llm-metadata-analyzer-online")
+        while True:
+            redis.publish(output_channel, "llm-metadata-analyzer-heartbeat")
+            time.sleep(30)
+        PY
+    environment:
+      - REDIS_URL=redis://redis-bus:6379/0
+      - INPUT_CHANNEL=texture:upscaled
+      - OUTPUT_CHANNEL=texture:metadata
+      - SHARED_PATH=/srv/textures
+    volumes:
+      - textures-share:/srv/textures
+    networks:
+      - cluster_net
+    depends_on:
+      - redis-bus
+    deploy:
+      replicas: 1
+      placement:
+        constraints:
+          - node.role == worker
+
