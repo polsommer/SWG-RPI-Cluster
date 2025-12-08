@@ -43,8 +43,18 @@ prepare_git_repo() {
   cd "$EXPORT_DIR"
 
   if [[ ! -d .git ]]; then
-    log "INFO" "Initializing git repository in $EXPORT_DIR"
-    git init
+    if [[ -n "$GIT_REMOTE_URL" ]]; then
+      log "INFO" "Cloning $GIT_REMOTE_URL into $EXPORT_DIR"
+      if git clone --branch "$GIT_BRANCH" "$GIT_REMOTE_URL" . >/dev/null 2>&1; then
+        cd "$EXPORT_DIR"
+      else
+        log "WARN" "Clone failed; falling back to initializing a fresh repo"
+        git init
+      fi
+    else
+      log "INFO" "Initializing git repository in $EXPORT_DIR"
+      git init
+    fi
   fi
 
   git config user.name "$GIT_USER_NAME"
