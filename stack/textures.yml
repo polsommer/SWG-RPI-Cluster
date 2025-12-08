@@ -29,16 +29,112 @@ services:
       - |
         pip install --no-cache-dir redis watchdog && \
         python - <<'PY'
+        import hashlib
+        import json
         import os
-        import time
+        from datetime import datetime
+        from pathlib import Path
+        from threading import Event
+
         from redis import Redis
-        redis = Redis.from_url(os.environ.get("REDIS_URL", "redis://redis-bus:6379/0"))
-        channel = os.environ.get("INGEST_CHANNEL", "texture:ingest")
-        path = os.environ.get("TEXTURE_PATH", "/srv/textures/incoming")
-        os.makedirs(path, exist_ok=True)
-        while True:
-            redis.publish(channel, f"scan {path}")
-            time.sleep(10)
+        from watchdog.events import FileSystemEventHandler
+        from watchdog.observers import Observer
+
+
+        def file_hash(path: Path) -> str:
+            digest = hashlib.sha256()
+            with path.open("rb") as file_handle:
+                for chunk in iter(lambda: file_handle.read(8192), b""):
+                    digest.update(chunk)
+            return digest.hexdigest()
+
+
+        def publish(redis_client: Redis, channel: str, message: dict, task_list: str | None, task_stream: str | None) -> None:
+            payload = json.dumps(message, separators=(",", ":"))
+            redis_client.publish(channel, payload)
+            if task_list:
+                redis_client.rpush(task_list, payload)
+            if task_stream:
+                redis_client.xadd(task_stream, {"event": payload})
+
+
+        def build_message(path: Path) -> dict:
+            stat = path.stat()
+            return {
+                "event": "file_detected",
+                "path": str(path),
+                "hash": file_hash(path),
+                "size": stat.st_size,
+                "mtime": datetime.utcfromtimestamp(stat.st_mtime).isoformat() + "Z",
+                "timestamp": datetime.utcnow().isoformat() + "Z",
+            }
+
+
+        class TextureIngestHandler(FileSystemEventHandler):
+            def __init__(self, seen: set[str], publisher):
+                super().__init__()
+                self.seen = seen
+                self.publisher = publisher
+
+            def _handle_path(self, path: Path) -> None:
+                if not path.exists() or path.is_dir():
+                    return
+                resolved = str(path.resolve())
+                if resolved in self.seen:
+                    return
+                self.seen.add(resolved)
+                message = build_message(path)
+                self.publisher(message)
+
+            def on_created(self, event):
+                if event.is_directory:
+                    return
+                self._handle_path(Path(event.src_path))
+
+            def on_moved(self, event):
+                if event.is_directory:
+                    return
+                self._handle_path(Path(event.dest_path))
+
+
+        def prime_cache(directory: Path, handler: TextureIngestHandler) -> None:
+            for path in directory.rglob("*"):
+                if path.is_file():
+                    handler._handle_path(path)
+
+
+        def main() -> None:
+            redis_url = os.environ.get("REDIS_URL", "redis://redis-bus:6379/0")
+            channel = os.environ.get("INGEST_CHANNEL", "texture:ingest")
+            path = Path(os.environ.get("TEXTURE_PATH", "/srv/textures/incoming"))
+            task_list = os.environ.get("INGEST_TASK_LIST")
+            task_stream = os.environ.get("INGEST_TASK_STREAM")
+
+            redis_client = Redis.from_url(redis_url)
+            path.mkdir(parents=True, exist_ok=True)
+
+            seen: set[str] = set()
+            publisher = lambda message: publish(redis_client, channel, message, task_list, task_stream)
+            handler = TextureIngestHandler(seen, publisher)
+
+            prime_cache(path, handler)
+
+            observer = Observer()
+            observer.schedule(handler, str(path), recursive=True)
+            observer.start()
+
+            stop_event = Event()
+            try:
+                stop_event.wait()
+            except KeyboardInterrupt:
+                pass
+            finally:
+                observer.stop()
+                observer.join()
+
+
+        if __name__ == "__main__":
+            main()
         PY
     environment:
       - REDIS_URL=redis://redis-bus:6379/0
