@@ -99,7 +99,7 @@ sync_files() {
     includes+=("--include=$pattern")
   done
 
-  rsync -av --delete --prune-empty-dirs --include='*/' "${includes[@]}" --exclude='*' "$WATCH_DIR/" "$EXPORT_DIR/" \
+  rsync -av --delete --prune-empty-dirs --exclude='/.git/' --include='*/' "${includes[@]}" --exclude='*' "$WATCH_DIR/" "$EXPORT_DIR/" \
     | while IFS= read -r line; do log "INFO" "rsync: $line"; done
 }
 
