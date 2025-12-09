@@ -192,8 +192,10 @@ textures to a dedicated Git repository (for example, an `HDtextureDDS` repo).
   - Optional: `inotifywait` (from `inotify-tools`) for event-driven file
     watching; otherwise the script falls back to interval polling.
 
-- **Configuration:** create a `.env` file next to the script (or set env vars in
-  the service unit) to avoid hardcoding secrets:
+- **Configuration:** by default, the script loads environment variables from a
+  `.env` file next to the script (`ENV_FILE` defaults to `scripts/.env`). You
+  can override `ENV_FILE` or set env vars in the service unit to avoid
+  hardcoding secrets:
 
   ```env
   WATCH_DIR=/srv/textures/output
