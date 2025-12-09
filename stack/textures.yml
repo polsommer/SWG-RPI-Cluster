@@ -296,7 +296,7 @@ services:
       retries: 3
       start_period: 15s
     deploy:
-      replicas: 2
+      replicas: ${ESRGAN_GPU_REPLICAS:-0}
       placement:
         max_replicas_per_node: 1
         constraints:

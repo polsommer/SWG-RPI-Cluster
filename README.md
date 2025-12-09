@@ -175,11 +175,12 @@ address if you use a NAS or other host.
    docker node update --label-add gpu=true <node-name>
    ```
 
-2. Deploy the stack, reusing the existing `cluster_net` overlay network created
-   by the demo scripts:
+2. Deploy the stack with the helper script, which auto-scales GPU replicas to
+   the number of nodes labeled `gpu=true` (or zero if none) and reuses the
+   existing `cluster_net` overlay network created by the demo scripts:
 
    ```bash
-   docker stack deploy -c stack/textures.yml swg-textures
+   sudo scripts/deploy-textures.sh stack/textures.yml swg-textures
    ```
 
    The compose file includes:
@@ -188,12 +189,17 @@ address if you use a NAS or other host.
    - **texture-ingestion** – publishes new work from `/srv/textures/incoming`
      into Redis so the upscalers can pick it up.
    - **esrgan-upscaler-gpu** – Real-ESRGAN workers pinned to GPU-labeled
-     workers (replicated across nodes with `max_replicas_per_node: 1`).
-   - **esrgan-upscaler-cpu** – CPU fallback upscalers for non-GPU workers.
-     Listens on `INPUT_CHANNEL` for `scan` events, pulls textures from
-     `/srv/textures/incoming`, writes CPU-safe upscales into
-     `/srv/textures/output`, and emits status/results on `OUTPUT_CHANNEL`
-     (JSON events for online status, completed scans, successes, and errors).
+     workers (replicated across nodes with `max_replicas_per_node: 1`). The
+     helper script sets `deploy.replicas` to the number of GPU nodes discovered
+     via `docker node ls --filter node.label=gpu=true` so the service scales
+     with available hardware.
+   - **esrgan-upscaler-cpu** – CPU fallback upscalers for non-GPU workers. When
+     no GPU nodes are present, the helper script sets GPU replicas to zero and
+     these workers continue handling requests. Listens on `INPUT_CHANNEL` for
+     `scan` events, pulls textures from `/srv/textures/incoming`, writes
+     CPU-safe upscales into `/srv/textures/output`, and emits status/results on
+     `OUTPUT_CHANNEL` (JSON events for online status, completed scans,
+     successes, and errors).
    - **metadata-analyzer** – LLM-driven metadata annotator that reads
      upscales, generates captions/tags through a configurable LLM backend, and
      publishes structured metadata on its own Redis channel while writing
