@@ -65,6 +65,20 @@
     .insight.ok .dot { background: var(--success); }
     .insight.warn .dot { background: var(--danger); }
     .insight.info .dot { background: var(--accent); }
+    .status-chip { display: inline-flex; align-items: center; gap: 6px; padding: 6px 10px; border-radius: 999px; font-weight: 700; }
+    .status-chip .dot { width: 10px; height: 10px; border-radius: 50%; }
+    .status-chip.good { background: rgba(52,211,153,0.16); color: var(--success); }
+    .status-chip.good .dot { background: var(--success); }
+    .status-chip.warn { background: rgba(248,113,113,0.12); color: var(--danger); }
+    .status-chip.warn .dot { background: var(--danger); }
+    .status-chip.neutral { background: rgba(255,255,255,0.08); color: var(--text); }
+    .status-chip.neutral .dot { background: var(--muted); }
+    .replica-bar { position: relative; height: 26px; border-radius: 10px; background: rgba(255,255,255,0.06); border: 1px solid var(--card-border); overflow: hidden; display: flex; align-items: center; }
+    .replica-bar .fill { position: absolute; inset: 0; background: linear-gradient(90deg, rgba(34,211,238,0.35), rgba(52,211,153,0.35)); }
+    .replica-bar.partial .fill { background: linear-gradient(90deg, rgba(248,113,113,0.25), rgba(234,179,8,0.3)); }
+    .replica-bar.empty .fill { background: rgba(248,113,113,0.25); }
+    .replica-bar .label { position: relative; width: 100%; text-align: center; font-weight: 700; color: var(--text); text-shadow: 0 1px 3px rgba(0,0,0,0.35); }
+    .service-row.warn { background: linear-gradient(90deg, rgba(248,113,113,0.08), transparent); }
     .event-log { list-style: none; padding-left: 0; margin: 0; display: grid; gap: 8px; }
     .event-log li { border: 1px solid var(--card-border); padding: 10px; border-radius: 10px; background: rgba(255,255,255,0.03); }
     .event-meta { display: flex; gap: 10px; flex-wrap: wrap; color: var(--muted); font-size: 0.9rem; }
@@ -157,7 +171,7 @@
       <h3>Services</h3>
       <div class="muted" style="margin-bottom: 8px;">Replicas, images, and exposed ports</div>
       <table id="services-table">
-        <thead><tr><th>Name</th><th>Image</th><th>Mode</th><th>Replicas</th><th>Ports</th></tr></thead>
+        <thead><tr><th>Name</th><th>Health</th><th>Image</th><th>Mode</th><th>Replicas</th><th>Ports</th></tr></thead>
         <tbody></tbody>
       </table>
     </div>
@@ -314,6 +328,30 @@
       return ports.map(p => `${p.PublishedPort || ''}:${p.TargetPort}/${p.Protocol || 'tcp'}`).join(', ');
     }
 
+    function serviceHealthStatus(service) {
+      const running = Number(service.running) || 0;
+      const desired = Number(service.desired) || 0;
+      if (desired === 0) {
+        return { label: 'Scaled to zero', className: 'neutral', detail: 'No replicas scheduled' };
+      }
+      if (running === 0) {
+        return { label: 'Down', className: 'warn', detail: 'No running replicas' };
+      }
+      if (running < desired) {
+        return { label: 'Degraded', className: 'warn', detail: `${desired - running} replicas missing` };
+      }
+      return { label: 'Healthy', className: 'good', detail: 'All replicas running' };
+    }
+
+    function replicaBar(running, desired) {
+      const current = Number(running) || 0;
+      const target = Number(desired) || 0;
+      const percent = target ? Math.min(100, Math.round((current / target) * 100)) : 0;
+      const stateClass = current === 0 ? 'empty' : (current < target ? 'partial' : '');
+      const label = `${current}/${target} replicas`;
+      return `<div class="replica-bar ${stateClass}"><div class="fill" style="width:${percent}%;"></div><div class="label">${label}</div></div>`;
+    }
+
     function renderSummary(data) {
       $('#timestamp').textContent = `Updated ${new Date(data.timestamp).toLocaleTimeString()}`;
 
@@ -370,12 +408,18 @@
 
       const services = data.services || [];
       $('#services-table tbody').innerHTML = services.map(s => {
-        const ok = s.running === s.desired;
-        return `<tr>
+        const status = serviceHealthStatus(s);
+        return `<tr class="service-row ${status.className}">
           <td><strong>${s.name}</strong><div class="muted">${s.id}</div></td>
+          <td>
+            <div class="stacked">
+              <span class="status-chip ${status.className}"><span class="dot"></span>${status.label}</span>
+              <span class="muted">${status.detail}</span>
+            </div>
+          </td>
           <td>${s.image}</td>
           <td>${s.mode}</td>
-          <td>${badge(`${s.running}/${s.desired}`, ok)}</td>
+          <td>${replicaBar(s.running, s.desired)}</td>
           <td>${formatPorts(s.ports)}</td>
         </tr>`;
       }).join('');
