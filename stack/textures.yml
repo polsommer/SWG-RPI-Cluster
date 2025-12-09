@@ -1,4 +1,4 @@
-version: "3.9"
+vversion: "4.0"
 
 networks:
   cluster_net:
@@ -6,7 +6,6 @@ networks:
 
 volumes:
   textures-share:
-    external: true
     driver: local
     driver_opts:
       type: nfs
@@ -19,6 +18,10 @@ configs:
     file: ./metadata_analyzer.py
 
 services:
+
+  # ---------------------------------------------------------
+  # Redis bus (central queue)
+  # ---------------------------------------------------------
   redis-bus:
     image: redis:7-alpine
     command: ["redis-server", "--appendonly", "yes"]
@@ -26,11 +29,24 @@ services:
       - redis-data:/data
     networks:
       - cluster_net
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
     deploy:
       placement:
         constraints:
           - node.role == manager
+      restart_policy:
+        condition: any
+        delay: 5s
+        max_attempts: 3
+        window: 30s
 
+  # ---------------------------------------------------------
+  # Texture ingestion (watches incoming directory and publishes to Redis)
+  # ---------------------------------------------------------
   texture-ingestion:
     image: python:3.11-slim
     command:
@@ -147,23 +163,47 @@ services:
             main()
         PY
     environment:
-      - REDIS_URL=redis://redis-bus:6379/0
-      - INGEST_CHANNEL=texture:ingest
-      - TEXTURE_PATH=/srv/textures/incoming
-      - OUTPUT_PATH=/srv/textures/processed
+      REDIS_URL: redis://redis-bus:6379/0
+      INGEST_CHANNEL: texture:ingest
+      TEXTURE_PATH: /srv/textures/incoming
+      OUTPUT_PATH: /srv/textures/processed
     volumes:
       - textures-share:/srv/textures
     networks:
       - cluster_net
     depends_on:
       - redis-bus
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "python",
+          "-c",
+          "import os; from redis import Redis; Redis.from_url(os.environ.get('REDIS_URL','redis://redis-bus:6379/0')).ping()",
+        ]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 15s
     deploy:
       replicas: 2
       placement:
         max_replicas_per_node: 1
         constraints:
           - node.role == worker
+          - node.labels.gpu != true
+      restart_policy:
+        condition: any
+        delay: 5s
+        max_attempts: 3
+        window: 60s
+      update_config:
+        parallelism: 1
+        order: start-first
 
+  # ---------------------------------------------------------
+  # ESRGAN GPU upscaler
+  # ---------------------------------------------------------
   esrgan-upscaler-gpu:
     image: ghcr.io/swg-rpi-cluster/esrgan-upscaler-gpu:latest
     command:
@@ -277,20 +317,26 @@ services:
               publish({"status": "error", "input": str(src), "error": str(exc)})
         PY
     environment:
-      - REDIS_URL=redis://redis-bus:6379/0
-      - INPUT_CHANNEL=texture:ingest
-      - OUTPUT_CHANNEL=texture:upscaled
-      - TEXTURE_PATH=/srv/textures
-      - OUTPUT_PATH=/srv/textures/output
-      - MODEL=RealESRGAN_x4plus
-      - OUTSCALE=4
-      - OUTPUT_SUFFIX=upscaled
+      REDIS_URL: redis://redis-bus:6379/0
+      INPUT_CHANNEL: texture:ingest
+      OUTPUT_CHANNEL: texture:upscaled
+      TEXTURE_PATH: /srv/textures
+      OUTPUT_PATH: /srv/textures/output
+      MODEL: RealESRGAN_x4plus
+      OUTSCALE: "4"
+      OUTPUT_SUFFIX: upscaled
     volumes:
       - textures-share:/srv/textures
     networks:
       - cluster_net
     healthcheck:
-      test: ["CMD", "python3", "-c", "import os; from redis import Redis; Redis.from_url(os.environ.get('REDIS_URL','redis://redis-bus:6379/0')).ping()"]
+      test:
+        [
+          "CMD",
+          "python3",
+          "-c",
+          "import os; from redis import Redis; Redis.from_url(os.environ.get('REDIS_URL','redis://redis-bus:6379/0')).ping()",
+        ]
       interval: 30s
       timeout: 10s
       retries: 3
@@ -307,9 +353,19 @@ services:
         delay: 10s
         max_attempts: 3
         window: 60s
+      resources:
+        reservations:
+          devices:
+            - capabilities: ["gpu"]
+      update_config:
+        parallelism: 1
+        order: start-first
     depends_on:
       - redis-bus
 
+  # ---------------------------------------------------------
+  # ESRGAN CPU fallback upscaler
+  # ---------------------------------------------------------
   esrgan-upscaler-cpu:
     image: ghcr.io/swg-rpi-cluster/esrgan-upscaler-cpu:latest
     command:
@@ -446,20 +502,26 @@ services:
                 time.sleep(5)
         PY
     environment:
-      - REDIS_URL=redis://redis-bus:6379/0
-      - INPUT_CHANNEL=texture:ingest
-      - OUTPUT_CHANNEL=texture:upscaled
-      - TEXTURE_PATH=/srv/textures
-      - INPUT_PATH=incoming
-      - OUTPUT_PATH=output
-      - UPSCALE_FACTOR=2
-      - UPSCALE_RETRIES=3
+      REDIS_URL: redis://redis-bus:6379/0
+      INPUT_CHANNEL: texture:ingest
+      OUTPUT_CHANNEL: texture:upscaled
+      TEXTURE_PATH: /srv/textures
+      INPUT_PATH: incoming
+      OUTPUT_PATH: output
+      UPSCALE_FACTOR: "2"
+      UPSCALE_RETRIES: "3"
     volumes:
       - textures-share:/srv/textures
     networks:
       - cluster_net
     healthcheck:
-      test: ["CMD", "python3", "-c", "import os; from redis import Redis; Redis.from_url(os.environ.get('REDIS_URL','redis://redis-bus:6379/0')).ping()"]
+      test:
+        [
+          "CMD",
+          "python3",
+          "-c",
+          "import os; from redis import Redis; Redis.from_url(os.environ.get('REDIS_URL','redis://redis-bus:6379/0')).ping()",
+        ]
       interval: 30s
       timeout: 10s
       retries: 3
@@ -478,7 +540,13 @@ services:
         delay: 10s
         max_attempts: 3
         window: 60s
+      update_config:
+        parallelism: 1
+        order: start-first
 
+  # ---------------------------------------------------------
+  # Metadata analyzer (LLM / echo backend)
+  # ---------------------------------------------------------
   metadata-analyzer:
     image: ghcr.io/swg-rpi-cluster/metadata-analyzer:latest
     command:
@@ -487,14 +555,14 @@ services:
       - |
         python3 /opt/metadata_analyzer.py
     environment:
-      - REDIS_URL=redis://redis-bus:6379/0
-      - INPUT_CHANNEL=texture:upscaled
-      - OUTPUT_CHANNEL=texture:metadata
-      - SHARED_PATH=/srv/textures
-      - LLM_BACKEND=echo
-      - LLM_MODEL=gpt-4o-mini
-      - METADATA_SUFFIX=.metadata.json
-      - HEARTBEAT_SECONDS=30
+      REDIS_URL: redis://redis-bus:6379/0
+      INPUT_CHANNEL: texture:upscaled
+      OUTPUT_CHANNEL: texture:metadata
+      SHARED_PATH: /srv/textures
+      LLM_BACKEND: echo
+      LLM_MODEL: gpt-4o-mini
+      METADATA_SUFFIX: ".metadata.json"
+      HEARTBEAT_SECONDS: "30"
     volumes:
       - textures-share:/srv/textures
     configs:
@@ -504,7 +572,13 @@ services:
     networks:
       - cluster_net
     healthcheck:
-      test: ["CMD", "python3", "-c", "import os, pathlib; from redis import Redis; assert pathlib.Path('/opt/metadata_analyzer.py').exists(); Redis.from_url(os.environ.get('REDIS_URL','redis://redis-bus:6379/0')).ping()"]
+      test:
+        [
+          "CMD",
+          "python3",
+          "-c",
+          "import os, pathlib; from redis import Redis; assert pathlib.Path('/opt/metadata_analyzer.py').exists(); Redis.from_url(os.environ.get('REDIS_URL','redis://redis-bus:6379/0')).ping()",
+        ]
       interval: 30s
       timeout: 10s
       retries: 3
@@ -516,9 +590,12 @@ services:
       placement:
         constraints:
           - node.role == worker
+          - node.labels.gpu != true
       restart_policy:
         condition: any
         delay: 10s
         max_attempts: 3
         window: 60s
-
+      update_config:
+        parallelism: 1
+        order: start-first
