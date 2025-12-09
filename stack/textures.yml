@@ -165,13 +165,12 @@ services:
           - node.role == worker
 
   esrgan-upscaler-gpu:
-    image: ghcr.io/xinntao/real-esrgan:latest
+    image: ghcr.io/swg-rpi-cluster/esrgan-upscaler-gpu:latest
     command:
       - /bin/sh
       - -c
       - |
-        pip install --no-cache-dir redis && \
-        python - <<'PY'
+        python3 - <<'PY'
         import json
         import os
         import pathlib
@@ -290,6 +289,12 @@ services:
       - textures-share:/srv/textures
     networks:
       - cluster_net
+    healthcheck:
+      test: ["CMD", "python3", "-c", "import os; from redis import Redis; Redis.from_url(os.environ.get('REDIS_URL','redis://redis-bus:6379/0')).ping()"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 15s
     deploy:
       replicas: 2
       placement:
@@ -297,17 +302,21 @@ services:
         constraints:
           - node.role == worker
           - node.labels.gpu == true
+      restart_policy:
+        condition: any
+        delay: 10s
+        max_attempts: 3
+        window: 60s
     depends_on:
       - redis-bus
 
   esrgan-upscaler-cpu:
-    image: python:3.11-slim
+    image: ghcr.io/swg-rpi-cluster/esrgan-upscaler-cpu:latest
     command:
       - /bin/sh
       - -c
       - |
-        pip install --no-cache-dir redis pillow && \
-        python - <<'PY'
+        python3 - <<'PY'
         import json
         import os
         import time
@@ -449,6 +458,12 @@ services:
       - textures-share:/srv/textures
     networks:
       - cluster_net
+    healthcheck:
+      test: ["CMD", "python3", "-c", "import os; from redis import Redis; Redis.from_url(os.environ.get('REDIS_URL','redis://redis-bus:6379/0')).ping()"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 15s
     depends_on:
       - redis-bus
     deploy:
@@ -458,15 +473,19 @@ services:
         constraints:
           - node.role == worker
           - node.labels.gpu != true
+      restart_policy:
+        condition: any
+        delay: 10s
+        max_attempts: 3
+        window: 60s
 
   metadata-analyzer:
-    image: python:3.11-slim
+    image: ghcr.io/swg-rpi-cluster/metadata-analyzer:latest
     command:
       - /bin/sh
       - -c
       - |
-        pip install --no-cache-dir redis requests pillow && \
-        python /opt/metadata_analyzer.py
+        python3 /opt/metadata_analyzer.py
     environment:
       - REDIS_URL=redis://redis-bus:6379/0
       - INPUT_CHANNEL=texture:upscaled
@@ -484,6 +503,12 @@ services:
         mode: 0444
     networks:
       - cluster_net
+    healthcheck:
+      test: ["CMD", "python3", "-c", "import os, pathlib; from redis import Redis; assert pathlib.Path('/opt/metadata_analyzer.py').exists(); Redis.from_url(os.environ.get('REDIS_URL','redis://redis-bus:6379/0')).ping()"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 15s
     depends_on:
       - redis-bus
     deploy:
@@ -491,4 +516,9 @@ services:
       placement:
         constraints:
           - node.role == worker
+      restart_policy:
+        condition: any
+        delay: 10s
+        max_attempts: 3
+        window: 60s
 
