@@ -10,6 +10,22 @@ if [[ $EUID -ne 0 ]]; then
   exit 1
 fi
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+CHECK_SCRIPT="${SCRIPT_DIR}/check-docker-version.sh"
+ALLOW_DOCKER_VERSION_MISMATCH=${ALLOW_DOCKER_VERSION_MISMATCH:-}
+if [[ -x "$CHECK_SCRIPT" ]]; then
+  if [[ -n "$ALLOW_DOCKER_VERSION_MISMATCH" ]]; then
+    if ! "$CHECK_SCRIPT" --warn-only; then
+      echo "Docker version mismatch detected; continuing because ALLOW_DOCKER_VERSION_MISMATCH is set." >&2
+    fi
+  else
+    if ! "$CHECK_SCRIPT"; then
+      echo "Docker version check failed. Set ALLOW_DOCKER_VERSION_MISMATCH=1 to skip blocking." >&2
+      exit 2
+    fi
+  fi
+fi
+
 if [[ $# -lt 2 ]]; then
   echo "Usage: $0 <manager_ip> <worker_token>" >&2
   exit 1
