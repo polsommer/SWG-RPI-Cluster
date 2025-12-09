@@ -38,6 +38,19 @@ fail() {
   exit 1
 }
 
+require_cmd() {
+  local cmd="$1"
+  local hint="$2"
+
+  if ! command -v "$cmd" >/dev/null 2>&1; then
+    local message="$cmd is required but not installed."
+    if [[ -n "$hint" ]]; then
+      message+=" $hint"
+    fi
+    fail "$message"
+  fi
+}
+
 prepare_git_repo() {
   mkdir -p "$EXPORT_DIR"
   cd "$EXPORT_DIR"
@@ -132,6 +145,9 @@ polling_loop() {
 }
 
 main() {
+  require_cmd "git" "Install git to enable repository initialization and pushes."
+  require_cmd "rsync" "Install rsync to stage textures into the export directory."
+
   if [[ ! -d "$WATCH_DIR" ]]; then
     log "WARN" "WATCH_DIR $WATCH_DIR does not exist; creating it"
     mkdir -p "$WATCH_DIR"
@@ -143,6 +159,7 @@ main() {
   if command -v inotifywait >/dev/null 2>&1; then
     watch_with_inotify
   else
+    log "WARN" "inotifywait not found; install inotify-tools for event-driven sync. Falling back to polling."
     polling_loop
   fi
 }
