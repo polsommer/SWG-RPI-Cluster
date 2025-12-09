@@ -1,12 +1,42 @@
 [Unit]
-Description=Texture export and Git sync
-After=network-online.target
+Description=Texture Export and Git Sync Service
+Wants=network-online.target
+After=network-online.target remote-fs.target
+# Optional: ensure the texture directory is mounted before starting
+RequiresMountsFor=/srv/textures
 
 [Service]
-EnvironmentFile=/srv/textures/.env
+Type=simple
+
+# Load sync environment settings
+EnvironmentFile=-/srv/textures/.env
+
+# Set working directory to the script's folder for safety
+WorkingDirectory=/srv/SWG-RPI-Cluster/scripts
+
+# The sync worker script
 ExecStart=/usr/bin/env bash /srv/SWG-RPI-Cluster/scripts/export-and-sync.sh
+
+# Restart policy
 Restart=always
-RestartSec=5s
+# Exponential backoff protections
+RestartSec=5
+StartLimitIntervalSec=60
+StartLimitBurst=10
+
+# Logging improvements
+SyslogIdentifier=texture-sync
+StandardOutput=journal
+StandardError=journal
+
+# Resource safety
+# Prevent accidental writing outside mapped directories
+ProtectSystem=full
+# Allow repo writes
+ReadWritePaths=/srv/textures /srv/SWG-RPI-Cluster/scripts
+
+# If using SSH key authentication ensure ssh-agent works
+# Environment="GIT_SSH_COMMAND=ssh -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new"
 
 [Install]
 WantedBy=multi-user.target

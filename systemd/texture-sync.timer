@@ -1,8 +1,24 @@
 [Unit]
-Description=Start texture sync watcher
+Description=Timer to trigger the Texture Export & Git Sync Service
+Documentation=https://github.com/polsommer/HDtextureDDS
+Wants=network-online.target
+After=network-online.target
 
 [Timer]
+# Delay after boot before first run
 OnBootSec=15s
+
+# Run periodically to ensure safety even if inotify fails
+OnUnitActiveSec=5m
+
+# Add jitter so multi-node systems do not sync at exact same moment
+RandomizedDelaySec=10s
+
+# Make sure that if the system was off during a scheduled time,
+# the missed event is triggered immediately when system boots
+Persistent=true
+
+# This ties the timer to the service
 Unit=texture-sync.service
 
 [Install]
