@@ -186,6 +186,12 @@ textures to a dedicated Git repository (for example, an `HDtextureDDS` repo).
   - Logs to stdout and, if `LOG_FILE` is set, appends to the specified file for
     operators to monitor.
 
+- **Dependencies:**
+  - `git` for cloning, committing, and pushing updates.
+  - `rsync` for mirroring rendered textures into the export workspace.
+  - Optional: `inotifywait` (from `inotify-tools`) for event-driven file
+    watching; otherwise the script falls back to interval polling.
+
 - **Configuration:** create a `.env` file next to the script (or set env vars in
   the service unit) to avoid hardcoding secrets:
 
