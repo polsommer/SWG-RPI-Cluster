@@ -10,34 +10,59 @@ volumes:
 services:
 
   # ---------------------------------------------------------
-  # Frontend / API (runs on ARM Pi workers)
+  # GPU TEXTURE UPSCALER (runs only on GPU nodes)
   # ---------------------------------------------------------
-  hello-app:
-    image: traefik/whoami:v1.10.2
+  llm-upscaler-gpu:
+    image: yourregistry/texture-upscaler-gpu:latest
     deploy:
-      replicas: 2
+      replicas: 1
       placement:
-        max_replicas_per_node: 1
         constraints:
-          - node.role == worker
-          - node.labels.arch == arm64
+          - node.labels.gpu == true    # GPU nodes only
+      resources:
+        reservations:
+          devices:
+            - capabilities: ["gpu"]    # Request GPU
+    environment:
+      MODEL: "upscale-texture-v1-gpu"
+      REDIS_HOST: redis-bus
     networks:
       - cluster_net
     ports:
-      - target: 80
-        published: 8080
+      - target: 8000
+        published: 8000
         mode: ingress
-    environment:
-      WHOAMI_NAME: "{{.Task.Name}}"
-      WHOAMI_HOSTNAME: "{{.Node.Hostname}}"
     healthcheck:
-      test: ["CMD", "wget", "-qO-", "http://localhost"]
-      interval: 10s
-      timeout: 2s
-      retries: 3
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 12s
+      timeout: 3s
+      retries: 5
 
   # ---------------------------------------------------------
-  # Redis message bus (runs on manager = i5)
+  # CPU FALLBACK UPSCALER (runs only on CPU nodes)
+  # ---------------------------------------------------------
+  llm-upscaler-cpu:
+    image: yourregistry/texture-upscaler-cpu:latest
+    deploy:
+      replicas: 1
+      placement:
+        constraints:
+          - node.labels.cpu == true    # CPU-only nodes
+      restart_policy:
+        condition: any
+    environment:
+      MODEL: "upscale-texture-v1"
+      REDIS_HOST: redis-bus
+    networks:
+      - cluster_net
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:7000/health"]
+      interval: 12s
+      timeout: 3s
+      retries: 5
+
+  # ---------------------------------------------------------
+  # REDIS MESSAGE BUS (runs on CPU nodes, saves GPU cycles)
   # ---------------------------------------------------------
   redis-bus:
     image: redis:7-alpine
@@ -47,15 +72,34 @@ services:
         condition: any
       placement:
         constraints:
-          - node.role == manager
-          - node.labels.arch == amd64
+          - node.labels.cpu == true      # CPU-only
     volumes:
       - redis-data:/data
     networks:
       - cluster_net
 
   # ---------------------------------------------------------
-  # Lightweight load testers (run on Pi workers)
+  # FRONTEND / API (CPU nodes only)
+  # ---------------------------------------------------------
+  hello-app:
+    image: traefik/whoami:v1.10.2
+    deploy:
+      replicas: 2
+      placement:
+        constraints:
+          - node.labels.cpu == true     # run only on CPU nodes
+    networks:
+      - cluster_net
+    ports:
+      - target: 80
+        published: 8080
+    environment:
+      WHOAMI_NAME: "{{.Task.Name}}"
+      WHOAMI_HOSTNAME: "{{.Node.Hostname}}"
+
+  # ---------------------------------------------------------
+  # LIGHTWORKERS (load testers / job dispatchers)
+  # CPU NODES ONLY
   # ---------------------------------------------------------
   echo-worker:
     image: curlimages/curl:8.8.0
@@ -63,52 +107,20 @@ services:
       sh -c '
         while true; do
           echo "--- $(date) ---";
-          curl -sw "status=%{http_code} host=%{remote_ip}\n" hello-app:80 || true;
+          curl -sw "status=%{http_code}\n" hello-app:80 || true;
           sleep 5;
         done
       '
     deploy:
       replicas: 2
-      restart_policy:
-        condition: any
       placement:
         constraints:
-          - node.role == worker
-          - node.labels.arch == arm64
+          - node.labels.cpu == true
     networks:
       - cluster_net
 
   # ---------------------------------------------------------
-  # LLM Texture Upscaler – CPU service (runs ONLY on i5)
-  # ---------------------------------------------------------
-  llm-upscaler:
-    image: yourregistry/texture-upscaler:latest
-    deploy:
-      replicas: 1
-      resources:
-        limits:
-          cpus: "3.5"
-          memory: 6G
-        reservations:
-          cpus: "1.5"
-          memory: 2G
-      placement:
-        constraints:
-          - node.labels.arch == amd64
-          - node.role == worker  # if i5 is both worker+manager, remove this line
-    environment:
-      MODEL: "upscale-texture-v1"
-      REDIS_HOST: redis-bus
-    networks:
-      - cluster_net
-    healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
-      interval: 15s
-      timeout: 3s
-      retries: 5
-
-  # ---------------------------------------------------------
-  # Swarm Dashboard (runs on manager)
+  # DASHBOARD (CPU nodes only)
   # ---------------------------------------------------------
   swarm-dashboard:
     image: swg-dashboard:local
@@ -121,11 +133,9 @@ services:
     ports:
       - target: 8081
         published: 8081
-        mode: ingress
     deploy:
-      restart_policy:
-        condition: any
       placement:
         constraints:
-          - node.role == manager
-          - node.labels.arch == amd64
+          - node.labels.cpu == true
+      restart_policy:
+        condition: any
