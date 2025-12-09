@@ -186,8 +186,9 @@ textures to a dedicated Git repository (for example, an `HDtextureDDS` repo).
   - Logs to stdout and, if `LOG_FILE` is set, appends to the specified file for
     operators to monitor.
 
-- **Configuration:** create a `.env` file next to the script (or set env vars in
-  the service unit) to avoid hardcoding secrets:
+- **Configuration:** create a `.env` file next to the script (default
+  `ENV_FILE=$SCRIPT_DIR/.env` when unset, while still honoring any explicitly set
+  `ENV_FILE` or systemd `EnvironmentFile`) to avoid hardcoding secrets:
 
   ```env
   WATCH_DIR=/srv/textures/output
