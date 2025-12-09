@@ -1,0 +1,9 @@
+[Unit]
+Description=Start texture sync watcher
+
+[Timer]
+OnBootSec=15s
+Unit=texture-sync.service
+
+[Install]
+WantedBy=timers.target

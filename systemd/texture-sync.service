@@ -1,0 +1,12 @@
+[Unit]
+Description=Texture export and Git sync
+After=network-online.target
+
+[Service]
+EnvironmentFile=/srv/textures/.env
+ExecStart=/usr/bin/env bash /srv/SWG-RPI-Cluster/scripts/export-and-sync.sh
+Restart=always
+RestartSec=5s
+
+[Install]
+WantedBy=multi-user.target
