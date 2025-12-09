@@ -6,6 +6,12 @@ networks:
 
 volumes:
   textures-share:
+    external: true
+    driver: local
+    driver_opts:
+      type: nfs
+      o: addr=pi-manager,rw,nfsvers=4
+      device: ":/srv/textures"
   redis-data:
 
 configs:

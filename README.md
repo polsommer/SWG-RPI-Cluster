@@ -129,6 +129,45 @@ single volume across ingestion, upscaling, and LLM metadata analysis workers.
 Placement constraints keep replicas on workers, with optional GPU labels for the
 Real-ESRGAN nodes.
 
+### Provision shared texture storage (manager + workers)
+The stack expects a shared export at `/srv/textures` mounted on every swarm
+node. The example below uses an NFS export from the manager; adjust the server
+address if you use a NAS or other host.
+
+1. On the chosen NFS server (for example the swarm manager), create the export
+   and ensure it is writable by the service users:
+
+   ```bash
+   sudo mkdir -p /srv/textures
+   sudo chown -R 1000:1000 /srv/textures
+   # Add to /etc/exports (example):
+   # /srv/textures 192.168.88.0/24(rw,sync,no_subtree_check)
+   sudo exportfs -rav
+   ```
+
+2. Create the swarm volume on **every** node so the external volume can be
+   attached when the stack is deployed. Replace `pi-manager` with your NFS
+   server's IP/hostname if different:
+
+   ```bash
+   docker volume create \
+     --driver local \
+     --opt type=nfs \
+     --opt o=addr=pi-manager,rw,nfsvers=4 \
+     --opt device=:/srv/textures \
+     textures-share
+   ```
+
+3. Verify the mount works on the manager and each worker before deploying the
+   stack:
+
+   ```bash
+   docker run --rm -v textures-share:/srv/textures alpine sh -c "touch /srv/textures/.probe && ls -l /srv/textures/.probe"
+   ```
+
+   Confirm the probe file appears on all nodes (remove it afterwards if
+   desired).
+
 1. (Optional) Label GPU-capable nodes so the Real-ESRGAN workers land where
    hardware acceleration is available:
 
