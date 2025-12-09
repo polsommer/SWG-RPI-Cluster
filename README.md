@@ -221,31 +221,17 @@ textures to a dedicated Git repository (for example, an `HDtextureDDS` repo).
   ```
 
 - **Scheduling options:**
-  - **systemd service + timer (recommended):**
+  - **systemd service + timer (recommended):** bundled units live in
+    `systemd/texture-sync.service` and `systemd/texture-sync.timer`, referencing
+    `/srv/textures/.env` plus the repo’s `scripts/export-and-sync.sh` path.
+    Install and enable them with one command:
 
-    ```ini
-    # /etc/systemd/system/texture-sync.service
-    [Unit]
-    Description=Texture export and Git sync
-    After=network-online.target
-
-    [Service]
-    EnvironmentFile=/srv/textures/.env
-    ExecStart=/usr/bin/bash /srv/SWG-RPI-Cluster/scripts/export-and-sync.sh
-    Restart=always
-    RestartSec=5s
-
-    # /etc/systemd/system/texture-sync.timer
-    [Unit]
-    Description=Start texture sync watcher
-
-    [Timer]
-    OnBootSec=15s
-    Unit=texture-sync.service
-
-    [Install]
-    WantedBy=timers.target
+    ```bash
+    sudo bash scripts/install-texture-sync-service.sh
     ```
+
+    The helper copies the units into `/etc/systemd/system`, reloads the daemon,
+    and starts `texture-sync.timer` immediately.
 
   - **Cron:** run a periodic sync if `inotifywait` isn’t available:
 
