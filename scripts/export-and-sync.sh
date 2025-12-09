@@ -1,8 +1,10 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+
 # Optional: load environment variables from a .env file.
-ENV_FILE=${ENV_FILE:-".env"}
+ENV_FILE=${ENV_FILE:-"$SCRIPT_DIR/.env"}
 if [[ -f "$ENV_FILE" ]]; then
   # shellcheck disable=SC1090
   set -o allexport
