@@ -113,13 +113,6 @@
       <div id="timestamp" class="pill">Loading...</div>
       <div id="admin-status" class="pill good" style="display:none;"></div>
     </div>
-    <div class="toolbar" id="auth-controls" style="flex-wrap: wrap;">
-      <input id="auth-token-input" class="token-input" type="password" placeholder="Access token" aria-label="Dashboard access token" />
-      <label class="muted" style="display:flex; align-items:center; gap:6px;"><input type="checkbox" id="remember-token" /> Remember on this device</label>
-      <button class="btn" onclick="saveAuthToken()">Save token</button>
-      <button class="btn ghost" onclick="clearAuthToken()">Clear</button>
-      <div id="auth-pill" class="pill neutral" style="display:none;">Auth required</div>
-    </div>
   </header>
 
   <section class="grid" id="overview">
@@ -235,7 +228,6 @@
   <script>
     const $ = (sel) => document.querySelector(sel);
     const REFRESH_MS = 5000;
-    const TOKEN_KEY = 'swarmAuthToken';
     let nodesCache = [];
     let onboardingTimer = null;
     let remediationEventsCache = [];
@@ -246,84 +238,8 @@
     let lastForecastServices = [];
     let lastAutoscalerConfig = {};
 
-    function getStoredToken() {
-      return sessionStorage.getItem(TOKEN_KEY) || localStorage.getItem(TOKEN_KEY) || '';
-    }
-
-    function persistToken(token, remember) {
-      if (remember) {
-        localStorage.setItem(TOKEN_KEY, token);
-        sessionStorage.removeItem(TOKEN_KEY);
-      } else {
-        sessionStorage.setItem(TOKEN_KEY, token);
-        localStorage.removeItem(TOKEN_KEY);
-      }
-    }
-
-    function updateAuthIndicator(token = null, error = false) {
-      const pill = document.getElementById('auth-pill');
-      if (!pill) return;
-      const current = token ?? getStoredToken();
-      if (!current) {
-        pill.textContent = 'Auth required';
-        pill.className = 'pill bad';
-        pill.style.display = 'inline-flex';
-        return;
-      }
-      pill.textContent = error ? 'Invalid token' : 'Authenticated';
-      pill.className = `pill ${error ? 'bad' : 'good'}`;
-      pill.style.display = 'inline-flex';
-    }
-
-    function saveAuthToken() {
-      const input = document.getElementById('auth-token-input');
-      const remember = document.getElementById('remember-token')?.checked;
-      const token = input?.value.trim();
-      if (!token) {
-        setStatus('Enter a token first', false);
-        return;
-      }
-      persistToken(token, remember);
-      updateAuthIndicator(token);
-      setStatus('Access token saved', true);
-    }
-
-    function clearAuthToken() {
-      sessionStorage.removeItem(TOKEN_KEY);
-      localStorage.removeItem(TOKEN_KEY);
-      const input = document.getElementById('auth-token-input');
-      if (input) input.value = '';
-      updateAuthIndicator('');
-      setStatus('Access token cleared', true);
-    }
-
-    function requireAuthToken(promptUser = false) {
-      let token = getStoredToken();
-      if (!token && promptUser) {
-        const provided = prompt('Enter dashboard access token');
-        if (provided) {
-          const remember = document.getElementById('remember-token')?.checked;
-          persistToken(provided.trim(), remember);
-          token = provided.trim();
-        }
-      }
-      updateAuthIndicator(token);
-      return token;
-    }
-
     async function authedFetch(url, options = {}) {
-      const token = requireAuthToken(true);
-      if (!token) {
-        throw new Error('Authentication required');
-      }
-      const headers = new Headers(options.headers || {});
-      headers.set('Authorization', `Bearer ${token}`);
-      const res = await fetch(url, { ...options, headers });
-      if (res.status === 401) {
-        updateAuthIndicator(null, true);
-        throw new Error('Unauthorized');
-      }
-      return res;
+      return fetch(url, options);
     }
 
     function badge(text, ok = true) {
@@ -1380,41 +1296,26 @@
 
     async function refresh() {
       try {
-        const token = requireAuthToken(true);
-        if (!token) {
-          $('#timestamp').textContent = 'Auth required';
-          return;
-        }
         const res = await authedFetch('/api/summary');
         const data = await res.json();
         renderSummary(data);
         renderInsights(data.insights);
       } catch (err) {
-        const msg = (err?.message || '').toLowerCase().includes('auth') ? 'Auth required' : 'Connection lost';
-        $('#timestamp').textContent = msg;
-        if (msg === 'Auth required') {
-          setStatus('Provide dashboard token to continue', false);
-        }
+        $('#timestamp').textContent = 'Connection lost';
         console.error(err);
       }
     }
 
     async function refreshAdmin() {
       try {
-        const token = requireAuthToken(true);
-        if (!token) return;
         const res = await authedFetch('/api/admin');
         const data = await res.json();
         renderAdmin(data);
       } catch (err) {
         console.error(err);
-        if ((err?.message || '').toLowerCase().includes('auth')) {
-          setStatus('Authentication required for admin calls', false);
-        }
       }
     }
 
-    updateAuthIndicator();
     refresh();
     refreshAdmin();
     setInterval(refresh, REFRESH_MS);

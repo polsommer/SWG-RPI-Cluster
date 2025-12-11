@@ -4,8 +4,6 @@ The Flask-based dashboard ships with the demo stack so you can see swarm health,
 
 The Control Center panel now exposes join commands, one-click token rotation, service scaling, and node drain/activation toggles so you can administer the swarm without leaving the browser.
 
-> **Security note:** All control-plane routes now require an access token. Set `DASHBOARD_AUTH_TOKEN` on the service and provide the same token in the UI to rotate join tokens, scale services, run SSH helpers, or change node availability.
-
 ## Prerequisites
 - The node must already belong to the Docker Swarm (manager node recommended because the dashboard needs the Docker socket).
 - Docker CLI access with permission to read `/var/run/docker.sock`.
@@ -41,7 +39,6 @@ services:
     image: swg-dashboard:local
     environment:
       - OVERLAY_NETWORK=cluster_net
-      - DASHBOARD_AUTH_TOKEN=replace-me
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock:ro
     networks:
@@ -59,11 +56,6 @@ STACK
 ```
 
 Once deployed, open `http://<manager-ip>:8081` for the live UI.
-
-### Authenticating to the UI
-1. Choose a strong token and set it via the `DASHBOARD_AUTH_TOKEN` environment variable on the service/container.
-2. Load the dashboard and enter the token in the **Access token** box in the header (or paste it into the prompt that appears). Check **Remember on this device** to persist the token in `localStorage`; leave it unchecked to store it in `sessionStorage` for the current browser session only.
-3. Every admin request automatically adds the `Authorization: Bearer <token>` header. Invalid or missing tokens return HTTP 401 and block node/service mutations, SSH passthrough, repository updates, and swarm join token rotation.
 
 ## 4) Verify and maintain
 - Check service status:
