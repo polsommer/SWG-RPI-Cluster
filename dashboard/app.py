@@ -3,6 +3,7 @@ from __future__ import annotations
 import atexit
 import base64
 import datetime as dt
+import copy
 import json
 import queue
 import os
@@ -434,41 +435,45 @@ def summarize_service_tasks(tasks: List[Dict[str, Any]]) -> Dict[str, int]:
     return summary
 
 
+def summarize_service(service: docker.models.services.Service) -> Dict[str, Any]:
+    attrs = service.attrs
+    spec = attrs.get("Spec", {})
+    mode = spec.get("Mode", {})
+    replicas = None
+    desired = None
+    if "Replicated" in mode:
+        replicas = mode["Replicated"].get("Replicas")
+        desired = replicas
+    start = time.perf_counter()
+    tasks = service.tasks()
+    task_query_ms = (time.perf_counter() - start) * 1000
+    running = len([t for t in tasks if t.get("Status", {}).get("State") == "running"])
+    desired = desired or len(tasks)
+
+    task_states = summarize_service_tasks(tasks)
+    template = spec.get("TaskTemplate", {}).get("ContainerSpec", {})
+    return {
+        "id": service.id[:12],
+        "name": spec.get("Name"),
+        "image": template.get("Image"),
+        "mode": "replicated" if "Replicated" in mode else "global",
+        "running": running,
+        "desired": desired,
+        "ports": attrs.get("Endpoint", {}).get("Ports", []),
+        "updated": attrs.get("UpdatedAt"),
+        "replicas": replicas,
+        "task_states": task_states,
+        "labels": template.get("Labels", {}),
+        "service_labels": spec.get("Labels", {}),
+        "env": template.get("Env", []),
+        "task_query_ms": task_query_ms,
+    }
+
+
 def summarize_services() -> List[Dict[str, Any]]:
     services = []
     for svc in client.services.list():
-        attrs = svc.attrs
-        spec = attrs.get("Spec", {})
-        mode = spec.get("Mode", {})
-        replicas = None
-        desired = None
-        if "Replicated" in mode:
-            replicas = mode["Replicated"].get("Replicas")
-            desired = replicas
-        start = time.perf_counter()
-        tasks = svc.tasks()
-        task_query_ms = (time.perf_counter() - start) * 1000
-        running = len([t for t in tasks if t.get("Status", {}).get("State") == "running"])
-        desired = desired or len(tasks)
-
-        task_states = summarize_service_tasks(tasks)
-        template = spec.get("TaskTemplate", {}).get("ContainerSpec", {})
-        services.append(
-            {
-                "id": svc.id[:12],
-                "name": spec.get("Name"),
-                "image": template.get("Image"),
-                "mode": "replicated" if "Replicated" in mode else "global",
-                "running": running,
-                "desired": desired,
-                "ports": attrs.get("Endpoint", {}).get("Ports", []),
-                "updated": attrs.get("UpdatedAt"),
-                "replicas": replicas,
-                "task_states": task_states,
-                "labels": template.get("Labels", {}),
-                "task_query_ms": task_query_ms,
-            }
-        )
+        services.append(summarize_service(svc))
     return services
 
 
@@ -506,6 +511,33 @@ def _register_attempt(service_id: str) -> None:
     meta["count"] += 1
     meta["last"] = time.time()
     SERVICE_ATTEMPTS[service_id] = meta
+
+
+def _update_service_spec(
+    service: docker.models.services.Service, modifier: Any
+) -> Tuple[Dict[str, Any] | None, Exception | None]:
+    try:
+        service.reload()
+        spec = copy.deepcopy(service.attrs.get("Spec", {}))
+        modifier(spec)
+
+        kwargs = {
+            "task_template": spec.get("TaskTemplate"),
+            "name": spec.get("Name"),
+            "labels": spec.get("Labels"),
+            "mode": spec.get("Mode"),
+            "update_config": spec.get("UpdateConfig"),
+            "networks": spec.get("Networks"),
+            "endpoint_spec": spec.get("EndpointSpec"),
+            "rollback_config": spec.get("RollbackConfig"),
+        }
+        kwargs = {k: v for k, v in kwargs.items() if v is not None}
+
+        service.update(**kwargs)
+        service.reload()
+        return summarize_service(service), None
+    except Exception as exc:  # noqa: BLE001
+        return None, exc
 
 
 def remediate_services(services: List[Dict[str, Any]]) -> None:
@@ -1531,6 +1563,131 @@ def scale_service(service_id: str) -> Any:
 
         service.scale(replicas_int)
         return jsonify({"ok": True, "service": service_id, "replicas": replicas_int})
+    except Exception as exc:  # noqa: BLE001
+        return jsonify({"error": str(exc)}), 500
+
+
+@app.post("/api/services/<service_id>/image")
+def update_service_image(service_id: str) -> Any:
+    payload = request.get_json(silent=True) or {}
+    image = str(payload.get("image", "")).strip()
+    tag = str(payload.get("tag", "")).strip()
+
+    if not image:
+        return jsonify({"error": "image is required"}), 400
+
+    image_ref = f"{image}:{tag}" if tag else image
+
+    try:
+        service = client.services.get(service_id)
+
+        def modifier(spec: Dict[str, Any]) -> None:
+            container = spec.setdefault("TaskTemplate", {}).setdefault("ContainerSpec", {})
+            container["Image"] = image_ref
+
+        summary, error = _update_service_spec(service, modifier)
+        if error:
+            raise error
+        return jsonify({"ok": True, "service": summary})
+    except Exception as exc:  # noqa: BLE001
+        return jsonify({"error": str(exc)}), 500
+
+
+@app.post("/api/services/<service_id>/env")
+def update_service_env(service_id: str) -> Any:
+    payload = request.get_json(silent=True) or {}
+    env = payload.get("env", [])
+
+    if isinstance(env, str):
+        env = [line.strip() for line in env.splitlines() if line.strip()]
+
+    if not isinstance(env, list):
+        return jsonify({"error": "env must be a list of strings"}), 400
+
+    cleaned_env = [str(item).strip() for item in env if str(item).strip()]
+
+    try:
+        service = client.services.get(service_id)
+
+        def modifier(spec: Dict[str, Any]) -> None:
+            container = spec.setdefault("TaskTemplate", {}).setdefault("ContainerSpec", {})
+            container["Env"] = cleaned_env
+
+        summary, error = _update_service_spec(service, modifier)
+        if error:
+            raise error
+        return jsonify({"ok": True, "service": summary})
+    except Exception as exc:  # noqa: BLE001
+        return jsonify({"error": str(exc)}), 500
+
+
+@app.post("/api/services/<service_id>/labels")
+def update_service_labels(service_id: str) -> Any:
+    payload = request.get_json(silent=True) or {}
+    labels = payload.get("labels", {})
+
+    if isinstance(labels, str):
+        parsed: Dict[str, str] = {}
+        for line in labels.splitlines():
+            if "=" not in line:
+                continue
+            key, value = line.split("=", 1)
+            key = key.strip()
+            value = value.strip()
+            if key:
+                parsed[key] = value
+        labels = parsed
+
+    if not isinstance(labels, dict):
+        return jsonify({"error": "labels must be an object"}), 400
+
+    normalized = {str(k).strip(): str(v).strip() for k, v in labels.items() if str(k).strip()}
+
+    try:
+        service = client.services.get(service_id)
+
+        def modifier(spec: Dict[str, Any]) -> None:
+            container = spec.setdefault("TaskTemplate", {}).setdefault("ContainerSpec", {})
+            container["Labels"] = normalized
+            merged = {**(spec.get("Labels") or {}), **normalized}
+            spec["Labels"] = merged
+
+        summary, error = _update_service_spec(service, modifier)
+        if error:
+            raise error
+        return jsonify({"ok": True, "service": summary})
+    except Exception as exc:  # noqa: BLE001
+        return jsonify({"error": str(exc)}), 500
+
+
+@app.post("/api/services/<service_id>/restart")
+def restart_service(service_id: str) -> Any:
+    try:
+        service = client.services.get(service_id)
+
+        def modifier(spec: Dict[str, Any]) -> None:
+            template = spec.setdefault("TaskTemplate", {})
+            force_update = int(template.get("ForceUpdate", 0) or 0)
+            template["ForceUpdate"] = force_update + 1
+
+        summary, error = _update_service_spec(service, modifier)
+        if error:
+            raise error
+        return jsonify({"ok": True, "service": summary})
+    except Exception as exc:  # noqa: BLE001
+        return jsonify({"error": str(exc)}), 500
+
+
+@app.post("/api/services/<service_id>/rollback")
+def rollback_service(service_id: str) -> Any:
+    try:
+        service = client.services.get(service_id)
+        if hasattr(service, "rollback"):
+            service.rollback()
+        else:
+            client.api.rollback_service(service_id)
+        service.reload()
+        return jsonify({"ok": True, "service": summarize_service(service)})
     except Exception as exc:  # noqa: BLE001
         return jsonify({"error": str(exc)}), 500
 
