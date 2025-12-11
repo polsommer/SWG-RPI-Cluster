@@ -559,8 +559,13 @@ services:
       INPUT_CHANNEL: texture:upscaled
       OUTPUT_CHANNEL: texture:metadata
       SHARED_PATH: /srv/textures
-      LLM_BACKEND: echo
+      LLM_PROVIDER: echo
       LLM_MODEL: gpt-4o-mini
+      LLM_TEMPERATURE: "0.4"
+      LLM_MAX_TOKENS: "0"
+      LLM_MAX_ATTEMPTS: "3"
+      LLM_BACKOFF_SECONDS: "1.0"
+      LLM_BACKOFF_CAP_SECONDS: "8.0"
       METADATA_SUFFIX: ".metadata.json"
       HEARTBEAT_SECONDS: "30"
     volumes:
