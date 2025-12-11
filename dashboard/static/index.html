@@ -90,6 +90,11 @@
     .log-line { display: grid; gap: 4px; padding: 10px; border: 1px solid var(--card-border); border-radius: 10px; background: rgba(255,255,255,0.04); }
     .log-target { font-weight: 700; color: var(--muted); }
     .log-message { white-space: pre-wrap; }
+    .sparkline { width: 100%; height: 70px; }
+    .stat-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 10px; }
+    .pill.info { background: rgba(34,211,238,0.16); color: var(--accent); }
+    .error-log { list-style: none; margin: 0; padding: 0; display: grid; gap: 8px; }
+    .error-log li { border: 1px solid var(--card-border); padding: 10px; border-radius: 10px; background: rgba(248,113,113,0.06); }
     @media (max-width: 720px) { header { flex-direction: column; align-items: flex-start; } }
   </style>
 </head>
@@ -137,6 +142,14 @@
     <div class="card">
       <h3>Texture LLM</h3>
       <div id="llm-card" class="stacked muted"></div>
+    </div>
+    <div class="card">
+      <h3>Texture Metrics</h3>
+      <div id="texture-metrics-card" class="stacked muted"></div>
+    </div>
+    <div class="card">
+      <h3>Recent LLM Errors</h3>
+      <div id="texture-errors-card" class="stacked muted"></div>
     </div>
     <div class="card" style="grid-column: 1 / -1;">
       <h3>Smart Insights</h3>
@@ -317,6 +330,17 @@
       return `<span class="tag ${ok ? 'ok' : 'warn'}">${text}</span>`;
     }
 
+    function sparkline(values = [], color = '#22d3ee') {
+      if (!values.length) return '<div class="muted">No samples yet.</div>';
+      const max = Math.max(...values, 1);
+      const points = values.map((v, i) => {
+        const x = (i / Math.max(values.length - 1, 1)) * 100;
+        const y = 100 - (Math.max(0, v) / max) * 100;
+        return `${x},${y}`;
+      }).join(' ');
+      return `<svg viewBox="0 0 100 100" preserveAspectRatio="none" class="sparkline"><polyline points="${points}" fill="none" stroke="${color}" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" /></svg>`;
+    }
+
     function scrollToSection(id) {
       const el = document.getElementById(id);
       if (!el) return;
@@ -406,6 +430,7 @@
       `;
 
       renderLlm(data.llm);
+      renderTextureMetrics(data.texture_metrics);
 
       const nodes = data.nodes || [];
       nodesCache = nodes;
@@ -582,6 +607,48 @@
         <div>${llm.message || 'Guiding remediation and forecasting.'}</div>
         ${endpoint}
       `;
+    }
+
+    function renderTextureMetrics(metrics) {
+      const root = document.getElementById('texture-metrics-card');
+      const errorRoot = document.getElementById('texture-errors-card');
+      if (!root || !errorRoot) return;
+
+      if (!metrics || !metrics.history || !metrics.history.length) {
+        root.innerHTML = '<div class="muted">No texture metrics reported yet.</div>';
+      } else {
+        const history = metrics.history;
+        const totals = metrics.totals || {};
+        const throughput = history.map(h => Number(h.ingested) || 0);
+        const latencies = history.map(h => Number(h.latency_ms) || 0);
+        const queueDepths = history.map(h => Number(h.queue_depth) || 0);
+        const successRate = totals.success_rate != null ? `${totals.success_rate.toFixed(1)}%` : 'n/a';
+        const avgLatency = totals.avg_latency_ms != null ? `${totals.avg_latency_ms.toFixed(1)} ms` : 'n/a';
+        const queueLabel = totals.queue_depth != null ? totals.queue_depth : 'n/a';
+
+        root.innerHTML = `
+          <div class="stat-grid">
+            <div><div class="muted">Throughput (latest ${history.length})</div><strong>${totals.ingested ?? 0} ingested</strong>${sparkline(throughput, '#22d3ee')}</div>
+            <div><div class="muted">LLM success rate</div><strong>${successRate}</strong><div class="muted">${totals.llm_success ?? 0} ok / ${totals.llm_failure ?? 0} fail</div></div>
+            <div><div class="muted">Average latency</div><strong>${avgLatency}</strong>${sparkline(latencies, '#34d399')}</div>
+            <div><div class="muted">Queue depth</div><strong>${queueLabel}</strong>${sparkline(queueDepths, '#f59e0b')}</div>
+          </div>
+        `;
+      }
+
+      const errors = metrics?.errors || [];
+      if (!errors.length) {
+        errorRoot.innerHTML = '<div class="muted">No recent LLM errors.</div>';
+      } else {
+        const list = errors.slice(-10).reverse().map(err => `
+          <li>
+            <div class="muted">${new Date(err.ts || Date.now()).toLocaleString()}</div>
+            <div><strong>${err.message || 'Unknown error'}</strong></div>
+            ${err.detail ? `<div class="muted">${typeof err.detail === 'string' ? err.detail : JSON.stringify(err.detail)}</div>` : ''}
+          </li>
+        `).join('');
+        errorRoot.innerHTML = `<ul class="error-log">${list}</ul>`;
+      }
     }
 
     function copyCommand(id) {
