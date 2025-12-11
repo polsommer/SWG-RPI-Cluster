@@ -42,6 +42,7 @@ SYNC_INTERVAL=${SYNC_INTERVAL:-30}
 LOG_FILE=${LOG_FILE:-""}
 PUSH_RETRIES=${PUSH_RETRIES:-3}
 DRY_RUN=${DRY_RUN:-0}
+FALLBACK_ARCHIVE_DIR=${FALLBACK_ARCHIVE_DIR:-"${EXPORT_DIR}/manual_review"}
 
 # -----------------------------------------------
 # HDtextureDDS integration
@@ -204,6 +205,7 @@ commit_and_push() {
 
   if [[ -z "$GIT_REMOTE_URL" ]]; then
     log "WARN" "GIT_REMOTE_URL not set; skipping push."
+    archive_for_manual_review "GIT_REMOTE_URL is unset"
     return
   fi
 
@@ -216,12 +218,29 @@ commit_and_push() {
     log "WARN" "Push failed (attempt $attempt). Retrying..."
     ((attempt++))
     if (( attempt > PUSH_RETRIES )); then
+      archive_for_manual_review "Git push failed after $PUSH_RETRIES attempts"
       fail "Push failed after $PUSH_RETRIES attempts."
     fi
     sleep 5
   done
 
   log "INFO" "Push successful."
+}
+
+archive_for_manual_review() {
+  local reason="$1"
+  local ts
+  ts=$(date -Iseconds | tr ':' '-')
+  local target_dir="${FALLBACK_ARCHIVE_DIR}/${ts}"
+
+  mkdir -p "$target_dir"
+
+  log "WARN" "GitHub upload unavailable (${reason}). Archiving staged files to: $target_dir"
+
+  rsync -av --exclude='.git/' "$EXPORT_DIR/" "$target_dir/" \
+    | while read -r line; do log "INFO" "archive: $line"; done
+
+  log "INFO" "Manual review archive ready at $target_dir. Transfer this directory to the intended repository when connectivity is restored."
 }
 
 # -----------------------------------------------
