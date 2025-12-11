@@ -252,6 +252,8 @@ textures to a dedicated Git repository (for example, an `HDtextureDDS` repo).
   GIT_USER_NAME=Texture Sync Bot
   GIT_USER_EMAIL=bot@example.com
   LOG_FILE=/var/log/texture-export.log
+  # Optional: override where staged files are archived if pushes can't reach GitHub
+  FALLBACK_ARCHIVE_DIR=/srv/textures/export/manual_review
   ```
 
 - **Syncing to the `polsommer/HDtextureDDS` repo:** set
@@ -305,7 +307,9 @@ textures to a dedicated Git repository (for example, an `HDtextureDDS` repo).
   - Script exits on errors and writes tagged log lines; configure `LOG_FILE` and
     `systemd` journal forwarding to alerting if needed.
   - Pushes are skipped (but not fatal) when `GIT_REMOTE_URL` is unset so local
-    staging can proceed.
+    staging can proceed. When GitHub upload isn’t available, staged files are
+    copied to a timestamped archive in `FALLBACK_ARCHIVE_DIR` (defaults to
+    `<EXPORT_DIR>/manual_review`) for manual inspection/upload.
   - `Restart=always` in systemd or `--restart-condition=any` in swarm keeps the
     watcher alive after transient failures.
 
