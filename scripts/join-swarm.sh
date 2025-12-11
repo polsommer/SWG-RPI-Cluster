@@ -58,26 +58,6 @@ if ! docker info >/dev/null 2>&1; then
   fatal "Docker is installed but not running."
 fi
 
-# ---------------------------- Version Check ------------------
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-CHECK_SCRIPT="${SCRIPT_DIR}/check-docker-version.sh"
-ALLOW_DOCKER_VERSION_MISMATCH=${ALLOW_DOCKER_VERSION_MISMATCH:-}
-
-if [[ -x "$CHECK_SCRIPT" ]]; then
-  if [[ -n "$ALLOW_DOCKER_VERSION_MISMATCH" ]]; then
-    if ! "$CHECK_SCRIPT" --warn-only; then
-      warn "Docker version mismatch; continuing due to ALLOW_DOCKER_VERSION_MISMATCH=1"
-    fi
-  else
-    if ! "$CHECK_SCRIPT"; then
-      fatal "Docker version check failed.
-Set ALLOW_DOCKER_VERSION_MISMATCH=1 to bypass."
-    fi
-  fi
-else
-  warn "Version check script missing: $CHECK_SCRIPT"
-fi
-
 # ---------------------------- Network Checks -----------------
 log "Checking connectivity to manager node..."
 

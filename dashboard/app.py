@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import atexit
-import base64
 import datetime as dt
 import copy
 import json
@@ -40,46 +39,12 @@ METRICS_LOCK = threading.Lock()
 STATE_LOCK = threading.Lock()
 TEXTURE_METRIC_HISTORY_LIMIT = int(os.environ.get("TEXTURE_METRIC_HISTORY_LIMIT", "500"))
 TEXTURE_ERROR_HISTORY_LIMIT = int(os.environ.get("TEXTURE_ERROR_HISTORY_LIMIT", "100"))
-AUTH_TOKEN = os.environ.get("DASHBOARD_AUTH_TOKEN", "").strip()
-PROTECTED_PATH_PREFIXES = ("/api/admin", "/api/nodes", "/api/services", "/api/texture")
 CONTROLLER_LOCK_FILE = Path(os.environ.get("DASHBOARD_CONTROLLER_LOCK", "/tmp/dashboard_controller.lock"))
 controller_lock_handle = None
 
 
 def _bool_env(name: str, default: bool = False) -> bool:
     return os.environ.get(name, str(default)).strip().lower() in {"1", "true", "yes", "on"}
-
-
-def _extract_auth_token() -> str | None:
-    header = request.headers.get("Authorization", "").strip()
-    if header.lower().startswith("bearer "):
-        return header.split(" ", 1)[1].strip()
-
-    if header.lower().startswith("basic "):
-        try:
-            raw = base64.b64decode(header.split(" ", 1)[1]).decode()
-            username, _, password = raw.partition(":")
-            return password or username or None
-        except Exception:  # noqa: BLE001
-            return None
-
-    return None
-
-
-@app.before_request
-def require_authentication() -> Any:
-    path = request.path or ""
-    if not any(path.startswith(prefix) for prefix in PROTECTED_PATH_PREFIXES):
-        return None
-
-    if not AUTH_TOKEN:
-        return jsonify({"error": "Authentication token is not configured"}), 401
-
-    provided = _extract_auth_token()
-    if not provided or provided != AUTH_TOKEN:
-        return jsonify({"error": "Unauthorized"}), 401
-
-    return None
 
 
 def _load_metrics_store() -> Dict[str, Any]:

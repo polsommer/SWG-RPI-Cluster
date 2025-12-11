@@ -44,25 +44,6 @@ if ! docker info >/dev/null 2>&1; then
   fatal "Docker daemon is not running."
 fi
 
-# ---------------------------- Version Check --------------------------
-CHECK_SCRIPT="${SCRIPT_DIR}/check-docker-version.sh"
-ALLOW_DOCKER_VERSION_MISMATCH="${ALLOW_DOCKER_VERSION_MISMATCH:-}"
-
-if [[ -x "$CHECK_SCRIPT" ]]; then
-  if [[ -n "$ALLOW_DOCKER_VERSION_MISMATCH" ]]; then
-    if ! "$CHECK_SCRIPT" --warn-only; then
-      warn "Docker version mismatch; continuing due to ALLOW_DOCKER_VERSION_MISMATCH=1"
-    fi
-  else
-    if ! "$CHECK_SCRIPT"; then
-      fatal "Docker Engine version check failed.
-Set ALLOW_DOCKER_VERSION_MISMATCH=1 to bypass."
-    fi
-  fi
-else
-  warn "Version checker missing: $CHECK_SCRIPT"
-fi
-
 # ---------------------------- Detect IP ------------------------------
 if [[ -z "$ADVERTISE_ADDR" ]]; then
   ADVERTISE_ADDR=$(hostname -I | awk '{print $1}')
