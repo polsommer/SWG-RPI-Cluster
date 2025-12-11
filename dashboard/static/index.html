@@ -328,6 +328,21 @@
       return ports.map(p => `${p.PublishedPort || ''}:${p.TargetPort}/${p.Protocol || 'tcp'}`).join(', ');
     }
 
+    function splitImageRef(image) {
+      if (!image) return { name: '', tag: '' };
+      const lastSlash = image.lastIndexOf('/');
+      const lastColon = image.lastIndexOf(':');
+      if (lastColon > lastSlash) {
+        return { name: image.slice(0, lastColon), tag: image.slice(lastColon + 1) };
+      }
+      return { name: image, tag: '' };
+    }
+
+    function labelsToText(labels) {
+      if (!labels || typeof labels !== 'object') return '';
+      return Object.entries(labels).map(([k, v]) => `${k}=${v}`).join('\n');
+    }
+
     function serviceHealthStatus(service) {
       const running = Number(service.running) || 0;
       const desired = Number(service.desired) || 0;
@@ -772,6 +787,112 @@
       }
     }
 
+    async function updateServiceImage(serviceId, imageInputId, tagInputId) {
+      const imageField = document.getElementById(imageInputId);
+      const tagField = document.getElementById(tagInputId);
+      const image = imageField ? imageField.value.trim() : '';
+      const tag = tagField ? tagField.value.trim() : '';
+      if (!image) {
+        setStatus('Image name is required', false);
+        return;
+      }
+
+      try {
+        const res = await authedFetch(`/api/services/${serviceId}/image`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ image, tag })
+        });
+        const payload = await res.json();
+        if (!res.ok || payload.error) throw new Error(payload.error || 'Update failed');
+        setStatus(`Updated image for ${serviceId}`, true);
+        await refresh();
+        await refreshAdmin();
+      } catch (err) {
+        console.error(err);
+        setStatus(err.message || 'Unable to update image', false);
+      }
+    }
+
+    async function updateServiceEnv(serviceId, textareaId) {
+      const field = document.getElementById(textareaId);
+      const lines = field ? field.value.split(/\r?\n/) : [];
+      const env = lines.map(l => l.trim()).filter(Boolean);
+
+      try {
+        const res = await authedFetch(`/api/services/${serviceId}/env`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ env })
+        });
+        const payload = await res.json();
+        if (!res.ok || payload.error) throw new Error(payload.error || 'Unable to save env');
+        setStatus(`Environment updated for ${serviceId}`, true);
+        await refresh();
+        await refreshAdmin();
+      } catch (err) {
+        console.error(err);
+        setStatus(err.message || 'Unable to update environment', false);
+      }
+    }
+
+    async function updateServiceLabels(serviceId, textareaId) {
+      const field = document.getElementById(textareaId);
+      const lines = field ? field.value.split(/\r?\n/) : [];
+      const labels = {};
+      lines.forEach(line => {
+        if (!line.includes('=')) return;
+        const [key, ...rest] = line.split('=');
+        const k = key.trim();
+        const v = rest.join('=').trim();
+        if (k) labels[k] = v;
+      });
+
+      try {
+        const res = await authedFetch(`/api/services/${serviceId}/labels`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ labels })
+        });
+        const payload = await res.json();
+        if (!res.ok || payload.error) throw new Error(payload.error || 'Unable to save labels');
+        setStatus(`Labels updated for ${serviceId}`, true);
+        await refresh();
+        await refreshAdmin();
+      } catch (err) {
+        console.error(err);
+        setStatus(err.message || 'Unable to update labels', false);
+      }
+    }
+
+    async function restartService(serviceId) {
+      try {
+        const res = await authedFetch(`/api/services/${serviceId}/restart`, { method: 'POST' });
+        const payload = await res.json();
+        if (!res.ok || payload.error) throw new Error(payload.error || 'Unable to restart');
+        setStatus(`Restart triggered for ${serviceId}`, true);
+        await refresh();
+        await refreshAdmin();
+      } catch (err) {
+        console.error(err);
+        setStatus(err.message || 'Unable to restart service', false);
+      }
+    }
+
+    async function rollbackService(serviceId) {
+      try {
+        const res = await authedFetch(`/api/services/${serviceId}/rollback`, { method: 'POST' });
+        const payload = await res.json();
+        if (!res.ok || payload.error) throw new Error(payload.error || 'Unable to rollback');
+        setStatus(`Rollback triggered for ${serviceId}`, true);
+        await refresh();
+        await refreshAdmin();
+      } catch (err) {
+        console.error(err);
+        setStatus(err.message || 'Unable to rollback service', false);
+      }
+    }
+
     async function updateServiceAutomation(serviceId, payload, successMessage = 'Updated automation settings') {
       try {
         const res = await authedFetch(`/api/services/${serviceId}/automation`, {
@@ -1037,6 +1158,10 @@
           <div class="stacked">
             ${services.length ? services.map((s, idx) => {
               const inputId = `scale-${idx}`;
+              const imageId = `image-${idx}`;
+              const tagId = `tag-${idx}`;
+              const envId = `env-${idx}`;
+              const labelId = `svc-labels-${idx}`;
               const current = s.replicas ?? s.desired ?? 1;
               const forecast = forecastMap[s.id] || {};
               const recommended = forecast.recommended_replicas ?? current;
@@ -1045,15 +1170,23 @@
               const autoScale = automation.auto_scale ?? !!forecast.auto_scale;
               const autoRemediate = automation.auto_remediate ?? true;
               const paused = automation.automation_paused ?? false;
+              const imageParts = splitImageRef(s.image || '');
+              const envText = (s.env || []).join('\\n');
+              const labelsText = labelsToText(s.labels || s.service_labels || {});
               return `
-                <div class="control-row">
-                  <div style="flex:1;">
-                    <strong>${s.name}</strong>
-                    <div class="muted">${s.image}</div>
-                    <div class="muted">Current: ${s.running}/${s.desired} • Forecast load: ${load}%</div>
-                    <div class="muted">Suggested replicas: ${recommended}</div>
+                <div class="control-row" style="flex-direction: column; align-items: stretch; gap: 10px;">
+                  <div class="toolbar" style="justify-content: space-between; flex-wrap: wrap; gap: 10px;">
+                    <div>
+                      <strong>${s.name}</strong>
+                      <div class="muted">${s.image}</div>
+                      <div class="muted">Current: ${s.running}/${s.desired} • Forecast load: ${load}% • Suggested replicas: ${recommended}</div>
+                    </div>
+                    <div class="toolbar" style="gap: 8px; flex-wrap: wrap;">
+                      <button class="btn" onclick="restartService('${s.id}')">Restart</button>
+                      <button class="btn ghost" onclick="rollbackService('${s.id}')">Rollback</button>
+                    </div>
                   </div>
-                  <div class="inline-input">
+                  <div class="inline-input" style="flex-wrap: wrap; gap: 10px;">
                     <label for="${inputId}" class="muted">Replicas</label>
                     <input id="${inputId}" type="number" min="0" value="${recommended}" />
                     <button class="btn" onclick="scaleService('${s.id}', '${inputId}')">Apply</button>
@@ -1066,6 +1199,29 @@
                     <label class="muted" style="display:flex; gap:6px; align-items:center;">
                       <input type="checkbox" ${paused ? 'checked' : ''} onchange="toggleAutomationPause('${s.id}', this.checked)" /> Pause automation
                     </label>
+                  </div>
+                  <div class="inline-input" style="flex-wrap: wrap; gap: 10px;">
+                    <label class="muted" for="${imageId}">Image</label>
+                    <input id="${imageId}" type="text" value="${imageParts.name}" placeholder="repo/image" />
+                    <label class="muted" for="${tagId}">Tag</label>
+                    <input id="${tagId}" type="text" value="${imageParts.tag}" placeholder="latest" />
+                    <button class="btn" onclick="updateServiceImage('${s.id}', '${imageId}', '${tagId}')">Update image</button>
+                  </div>
+                  <div class="control-row" style="gap: 12px; flex-wrap: wrap; align-items: flex-start; background: transparent; border: none; padding: 0;">
+                    <div style="flex:1; min-width: 240px;">
+                      <div class="muted">Environment (KEY=VALUE per line)</div>
+                      <textarea id="${envId}" style="width:100%; min-height: 72px; border-radius: 10px; border: 1px solid var(--card-border); background: rgba(0,0,0,0.25); color: var(--text); padding: 8px;">${envText}</textarea>
+                      <div style="margin-top: 6px; display:flex; gap:8px; justify-content:flex-end;">
+                        <button class="btn" onclick="updateServiceEnv('${s.id}', '${envId}')">Save env</button>
+                      </div>
+                    </div>
+                    <div style="flex:1; min-width: 240px;">
+                      <div class="muted">Labels (key=value per line)</div>
+                      <textarea id="${labelId}" style="width:100%; min-height: 72px; border-radius: 10px; border: 1px solid var(--card-border); background: rgba(0,0,0,0.25); color: var(--text); padding: 8px;">${labelsText}</textarea>
+                      <div style="margin-top: 6px; display:flex; gap:8px; justify-content:flex-end;">
+                        <button class="btn" onclick="updateServiceLabels('${s.id}', '${labelId}')">Save labels</button>
+                      </div>
+                    </div>
                   </div>
                 </div>
               `;
