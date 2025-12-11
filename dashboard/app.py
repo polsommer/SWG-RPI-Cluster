@@ -38,8 +38,10 @@ METRICS_STORE = Path(os.environ.get("METRICS_STORE", "/tmp/service_metrics.json"
 STATE_STORE = Path(os.environ.get("DASHBOARD_STATE_STORE", "/tmp/dashboard_state.json"))
 METRICS_LOCK = threading.Lock()
 STATE_LOCK = threading.Lock()
+TEXTURE_METRIC_HISTORY_LIMIT = int(os.environ.get("TEXTURE_METRIC_HISTORY_LIMIT", "500"))
+TEXTURE_ERROR_HISTORY_LIMIT = int(os.environ.get("TEXTURE_ERROR_HISTORY_LIMIT", "100"))
 AUTH_TOKEN = os.environ.get("DASHBOARD_AUTH_TOKEN", "").strip()
-PROTECTED_PATH_PREFIXES = ("/api/admin", "/api/nodes", "/api/services")
+PROTECTED_PATH_PREFIXES = ("/api/admin", "/api/nodes", "/api/services", "/api/texture")
 CONTROLLER_LOCK_FILE = Path(os.environ.get("DASHBOARD_CONTROLLER_LOCK", "/tmp/dashboard_controller.lock"))
 controller_lock_handle = None
 
@@ -730,6 +732,74 @@ def host_metrics() -> Dict[str, Any]:
     }
 
 
+def _texture_metrics_bucket(store: Dict[str, Any]) -> Dict[str, Any]:
+    return store.setdefault("texture", {"history": [], "errors": []})
+
+
+def record_texture_metrics(payload: Dict[str, Any]) -> Dict[str, Any]:
+    store = _load_metrics_store()
+    bucket = _texture_metrics_bucket(store)
+    now = (payload.get("ts") or dt.datetime.utcnow().isoformat()) + ("Z" if not str(payload.get("ts", "")).endswith("Z") else "")
+
+    entry = {
+        "ts": now,
+        "ingested": int(payload.get("ingested") or payload.get("ingest_count") or 0),
+        "llm_success": int(payload.get("llm_success") or payload.get("llm_successes") or 0),
+        "llm_failure": int(payload.get("llm_failure") or payload.get("llm_failures") or 0),
+        "latency_ms": float(payload.get("latency_ms") or payload.get("latency") or 0.0),
+        "queue_depth": int(payload.get("queue_depth") or 0),
+    }
+
+    bucket.setdefault("history", []).append(entry)
+    if len(bucket["history"]) > TEXTURE_METRIC_HISTORY_LIMIT:
+        bucket["history"] = bucket["history"][-TEXTURE_METRIC_HISTORY_LIMIT:]
+
+    errors = payload.get("errors") or []
+    if payload.get("llm_error"):
+        errors.append(payload["llm_error"])
+
+    for err in errors:
+        message = err if isinstance(err, str) else err.get("message") if isinstance(err, dict) else str(err)
+        bucket.setdefault("errors", []).append({"ts": now, "message": message, "detail": err})
+
+    if len(bucket.get("errors", [])) > TEXTURE_ERROR_HISTORY_LIMIT:
+        bucket["errors"] = bucket["errors"][-TEXTURE_ERROR_HISTORY_LIMIT:]
+
+    store["last_updated"] = now
+    store["texture"] = bucket
+    _persist_metrics_store(store)
+    return bucket
+
+
+def texture_metrics_snapshot(limit: int = 200) -> Dict[str, Any]:
+    store = _load_metrics_store()
+    bucket = _texture_metrics_bucket(store)
+    history = (bucket.get("history") or [])[-limit:]
+    errors = (bucket.get("errors") or [])[-20:]
+
+    total_ingested = sum(int(h.get("ingested", 0) or 0) for h in history)
+    llm_success = sum(int(h.get("llm_success", 0) or 0) for h in history)
+    llm_failure = sum(int(h.get("llm_failure", 0) or 0) for h in history)
+    success_total = llm_success + llm_failure
+    success_rate = (llm_success / success_total * 100) if success_total else None
+
+    latency_values = [float(h.get("latency_ms", 0.0)) for h in history if h.get("latency_ms") is not None]
+    avg_latency = sum(latency_values) / len(latency_values) if latency_values else None
+
+    return {
+        "history": history,
+        "errors": errors,
+        "totals": {
+            "ingested": total_ingested,
+            "llm_success": llm_success,
+            "llm_failure": llm_failure,
+            "success_rate": success_rate,
+            "avg_latency_ms": avg_latency,
+            "queue_depth": history[-1].get("queue_depth") if history else None,
+        },
+    }
+
+
 def record_service_metrics(services: List[Dict[str, Any]], host: Dict[str, Any]) -> Dict[str, Any]:
     store = _load_metrics_store()
     services_bucket = store.setdefault("services", {})
@@ -1330,6 +1400,19 @@ def remediation_loop() -> None:
         time.sleep(AUTO_REMEDIATE_INTERVAL)
 
 
+@app.post("/api/texture/metrics")
+def ingest_texture_metrics() -> Any:
+    payload = request.get_json(force=True, silent=True) or {}
+    bucket = record_texture_metrics(payload)
+    latest = bucket.get("history", [])[-1] if bucket.get("history") else None
+    return jsonify({"status": "ok", "recorded": latest})
+
+
+@app.get("/api/texture/metrics")
+def fetch_texture_metrics() -> Any:
+    return jsonify(texture_metrics_snapshot())
+
+
 @app.route("/api/summary")
 def summary() -> Any:
     info = client.info()
@@ -1359,6 +1442,7 @@ def summary() -> Any:
         "insights": insights,
         "redis_ping": worker_echo_rates(),
         "llm": texture_llm_status(),
+        "texture_metrics": texture_metrics_snapshot(120),
         "forecasts": forecasts,
         "remediation": {
             "config": remediation_config(),
@@ -1408,6 +1492,7 @@ def admin() -> Any:
             "forecasts": build_forecast_snapshot(services),
             "autoscaler_events": list(scale_events),
             "llm": texture_llm_status(),
+            "texture_metrics": texture_metrics_snapshot(120),
             "controller_config": controller_cfg,
             "service_automation": automation_overrides,
             "onboarding": onboarding_snapshot(),
