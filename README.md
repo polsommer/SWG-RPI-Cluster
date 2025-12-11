@@ -246,6 +246,9 @@ textures to a dedicated Git repository (for example, an `HDtextureDDS` repo).
     (default: `*.dds *.png`).
   - Syncs staged files into `EXPORT_DIR` (default: `/srv/textures/export`) using
     `rsync`, commits them, and pushes to `GIT_REMOTE_URL` on `GIT_BRANCH`.
+  - Optionally pulls `polsommer/HDtextureDDS` and runs its preprocess/upscaler
+    entrypoints before each sync so DDS assets are converted and enhanced by
+    your configured LLM pipeline.
   - Supports SSH deploy keys via `GIT_SSH_KEY_PATH` or HTTPS tokens embedded in
     `GIT_REMOTE_URL` (e.g., `https://<token>@github.com/org/HDtextureDDS.git`).
   - Logs to stdout and, if `LOG_FILE` is set, appends to the specified file for
@@ -279,6 +282,14 @@ textures to a dedicated Git repository (for example, an `HDtextureDDS` repo).
   GIT_USER_NAME=Texture Sync Bot
   GIT_USER_EMAIL=bot@example.com
   LOG_FILE=/var/log/texture-export.log
+  # HDtextureDDS automation
+  HD_DDS_ENABLED=1
+  HD_DDS_AUTO_PROCESS=1
+  HD_DDS_UPSCALE_SCRIPT=/srv/SWG-RPI-Cluster/scripts/HDtextureDDS/tools/upscale_with_llm.sh
+  HD_DDS_SOURCE_DIR=/srv/textures/output
+  HD_DDS_OUTPUT_DIR=/srv/textures/output
+  # Optional: pass additional arguments to the upscaler entrypoint
+  HD_DDS_UPSCALE_ARGS="--model my-llm --strength 0.8"
   # Optional: override where staged files are archived if pushes can't reach GitHub
   FALLBACK_ARCHIVE_DIR=/srv/textures/export/manual_review
   ```

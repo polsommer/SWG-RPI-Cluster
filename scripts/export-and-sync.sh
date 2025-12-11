@@ -47,9 +47,15 @@ FALLBACK_ARCHIVE_DIR=${FALLBACK_ARCHIVE_DIR:-"${EXPORT_DIR}/manual_review"}
 # -----------------------------------------------
 # HDtextureDDS integration
 # -----------------------------------------------
-HD_DDS_ENABLED=${HD_DDS_ENABLED:-1}  
+HD_DDS_ENABLED=${HD_DDS_ENABLED:-1}
 HD_DDS_REPO="https://github.com/polsommer/HDtextureDDS.git"
 HD_DDS_DIR="$SCRIPT_DIR/HDtextureDDS"
+HD_DDS_AUTO_PROCESS=${HD_DDS_AUTO_PROCESS:-1}
+HD_DDS_SOURCE_DIR=${HD_DDS_SOURCE_DIR:-"$WATCH_DIR"}
+HD_DDS_OUTPUT_DIR=${HD_DDS_OUTPUT_DIR:-"$WATCH_DIR"}
+HD_DDS_UPSCALE_SCRIPT=${HD_DDS_UPSCALE_SCRIPT:-"$HD_DDS_DIR/tools/upscale_with_llm.sh"}
+# Space-delimited extra args passed to the upscaler entrypoint
+HD_DDS_UPSCALE_ARGS=${HD_DDS_UPSCALE_ARGS:-""}
 
 ensure_hdtexturedds_repo() {
   if [[ "$HD_DDS_ENABLED" != "1" ]]; then
@@ -72,23 +78,50 @@ ensure_hdtexturedds_repo() {
 process_with_hdtexturedds() {
   if [[ "$HD_DDS_ENABLED" != "1" ]]; then return; fi
 
+  if [[ "$HD_DDS_AUTO_PROCESS" != "1" ]]; then
+    log "INFO" "HDtextureDDS auto-processing disabled."
+    return
+  fi
+
   log "INFO" "Running HDtextureDDS preprocess step..."
 
   DDS_SCRIPT="$HD_DDS_DIR/tools/convert_to_dds.sh"
 
   if [[ ! -x "$DDS_SCRIPT" ]]; then
     log "WARN" "HDtextureDDS conversion script missing or not executable: $DDS_SCRIPT"
+  else
+    # Convert any non-DDS textures in WATCH_DIR
+    find "$WATCH_DIR" -type f \( -iname "*.png" -o -iname "*.jpg" -o -iname "*.jpeg" \) | \
+    while read -r file; do
+        log "INFO" "Converting to DDS: $file"
+        "$DDS_SCRIPT" "$file" || log "WARN" "Conversion failed for: $file"
+    done
+  fi
+
+  log "INFO" "HDtextureDDS preprocess complete."
+}
+
+run_hdtexturedds_upscale() {
+  if [[ "$HD_DDS_ENABLED" != "1" ]]; then return; fi
+  if [[ "$HD_DDS_AUTO_PROCESS" != "1" ]]; then return; fi
+
+  local script="$HD_DDS_UPSCALE_SCRIPT"
+  if [[ ! -x "$script" ]]; then
+    log "WARN" "HDtextureDDS upscaler missing or not executable: $script"
+    log "INFO" "Set HD_DDS_UPSCALE_SCRIPT to your entrypoint or disable with HD_DDS_AUTO_PROCESS=0."
     return
   fi
 
-  # Convert any non-DDS textures in WATCH_DIR
-  find "$WATCH_DIR" -type f \( -iname "*.png" -o -iname "*.jpg" -o -iname "*.jpeg" \) | \
-  while read -r file; do
-      log "INFO" "Converting to DDS: $file"
-      "$DDS_SCRIPT" "$file" || log "WARN" "Conversion failed for: $file"
-  done
+  log "INFO" "Running HDtextureDDS upscaler: $script"
+  log "INFO" "Source: $HD_DDS_SOURCE_DIR → Output: $HD_DDS_OUTPUT_DIR"
 
-  log "INFO" "HDtextureDDS processing complete."
+  # shellcheck disable=SC2206
+  local extra_args=( $HD_DDS_UPSCALE_ARGS )
+  if ! "$script" "$HD_DDS_SOURCE_DIR" "$HD_DDS_OUTPUT_DIR" "${extra_args[@]}"; then
+    log "WARN" "HDtextureDDS upscaler reported a non-zero exit; continuing sync."
+  else
+    log "INFO" "HDtextureDDS upscaler complete."
+  fi
 }
 
 # -----------------------------------------------
@@ -251,6 +284,7 @@ run_sync_cycle() {
 
   ensure_hdtexturedds_repo
   process_with_hdtexturedds
+  run_hdtexturedds_upscale
 
   prepare_git_repo
   sync_files
