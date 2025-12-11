@@ -21,6 +21,19 @@ process repeatable on fresh or recycled Pis.
 - (Optional) DNS or mDNS so you can visit `http://pi-manager:8080`
 
 ## Quickstart
+Pick the **one-liner** flow for each node or follow the step-by-step commands
+below.
+
+### One-liner bootstrap (per node)
+- Manager: `sudo bash scripts/bootstrap-node.sh manager 192.168.88.7`
+- Worker: `sudo bash scripts/bootstrap-node.sh worker 192.168.88.7 SWMTKN-1-...`
+
+The helper chains the existing scripts: managers install Docker, initialize the
+swarm, and deploy the demo stack; workers install Docker and join using the
+provided token (prompted if omitted). If the manager adds cgroup flags to
+`/boot/cmdline.txt`, it offers a reboot before continuing.
+
+### Step-by-step flow
 Each step is a single command. Follow them in order and run the commands exactly
 as shown on the indicated nodes.
 
