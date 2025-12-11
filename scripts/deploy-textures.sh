@@ -72,16 +72,30 @@ fi
 # -------------------------------------------------------
 # Ensure overlay network exists
 # -------------------------------------------------------
-if ! docker network ls --format '{{.Name}}' | grep -q '^cluster_net$'; then
-  log "INFO" "Creating overlay network 'cluster_net'..."
+create_cluster_net() {
+  log "INFO" "Creating overlay network 'cluster_net' (attachable, encrypted)..."
   docker network create \
     --driver overlay \
     --attachable \
     --opt encrypted=true \
     cluster_net
   log "INFO" "Network 'cluster_net' created."
+}
+
+if docker network ls --format '{{.Name}}' | grep -q '^cluster_net$'; then
+  driver=$(docker network inspect cluster_net --format '{{.Driver}}')
+  attachable=$(docker network inspect cluster_net --format '{{.Attachable}}')
+  encrypted=$(docker network inspect cluster_net --format '{{index .Options "encrypted"}}')
+
+  if [[ "$driver" != "overlay" || "$attachable" != "true" || "$encrypted" != "true" ]]; then
+    log "WARN" "Existing 'cluster_net' is misconfigured (driver=$driver, attachable=$attachable, encrypted=${encrypted:-unset}). Recreating..."
+    docker network rm cluster_net
+    create_cluster_net
+  else
+    log "INFO" "Overlay network 'cluster_net' already exists and is correctly configured."
+  fi
 else
-  log "INFO" "Overlay network 'cluster_net' already exists."
+  create_cluster_net
 fi
 
 # -------------------------------------------------------

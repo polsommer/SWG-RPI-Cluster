@@ -175,7 +175,14 @@ address if you use a NAS or other host.
    docker node update --label-add gpu=true <node-name>
    ```
 
-2. Deploy the stack with the helper script, which auto-scales GPU replicas to
+1. If you are deploying the texture stack without first running the demo stack,
+   create the shared overlay network in advance (idempotent and safe to rerun):
+
+   ```bash
+   docker network create --driver overlay --attachable --opt encrypted=true cluster_net
+   ```
+
+1. Deploy the stack with the helper script, which auto-scales GPU replicas to
    the number of nodes labeled `gpu=true` (or zero if none) and reuses the
    existing `cluster_net` overlay network created by the demo scripts:
 
