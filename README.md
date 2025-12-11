@@ -236,6 +236,13 @@ textures to a dedicated Git repository (for example, an `HDtextureDDS` repo).
   - `rsync` for mirroring rendered textures into the export workspace.
   - Optional: `inotifywait` (from `inotify-tools`) for event-driven file
     watching; otherwise the script falls back to interval polling.
+  - Install the Raspberry Pi OS dependencies with:
+
+    ```bash
+    sudo apt-get install -y git rsync inotify-tools
+    ```
+
+    `inotify-tools` is optional, so skip it if unavailable.
 
 - **Configuration:** by default, the script loads environment variables from a
   `.env` file next to the script (`ENV_FILE` defaults to `scripts/.env`). You
